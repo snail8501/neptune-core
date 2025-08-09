@@ -145,9 +145,6 @@ features = ["user-hooks"]
 name = "neptune-core"
 path = "src/main.rs"
 
-[lints]
-workspace = true
-
 ## We use harness = false on these so that the divan reports are output on stdout.
 
 [[bench]]

@@ -160,7 +160,6 @@ pub enum BlockProof {
 // exist no impls for `OnceLock<_>` so derive fails.
 //
 // A unit test-suite exists in module tests::digest_encapsulation.
-#[readonly::make]
 #[derive(Debug, Clone, Serialize, Deserialize, BFieldCodec, GetSize)]
 pub struct Block {
     /// Everything but the proof
