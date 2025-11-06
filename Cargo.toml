@@ -1,113 +1,198 @@
-[workspace]
-resolver="2"
+[package]
+name = "neptune-cash"
+description = "A layer-1 cryptocurrency featuring scalable privacy and post-quantum security."
+authors = ["Triton Software"]
 
-members = [
-    "neptune-core",
-    "neptune-core-cli",
-    "neptune-dashboard",
-    "neptune-rpc/macros",
-]
+version = "0.4.0"
+edition = "2021"
+license = "Apache-2.0"
+readme = "../README.md"
 
-[workspace.lints.rust]
-missing_copy_implementations = "warn"
-missing_debug_implementations = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+homepage = "https://neptune.cash/"
+repository = "https://github.com/Neptune-Crypto/neptune-core/"
 
-[workspace.lints.clippy]
-cast_lossless = "warn"
-cloned_instead_of_copied = "warn"
-copy_iterator = "warn"
-doc_link_with_quotes = "warn"
-enum_glob_use = "warn"
-expl_impl_clone_on_copy = "warn"
-#explicit_deref_methods = "warn" # Does not play ball with proptest
-explicit_into_iter_loop = "warn"
-explicit_iter_loop = "warn"
-filter_map_next = "warn"
-flat_map_option = "warn"
-fn_params_excessive_bools = "warn"
-from_iter_instead_of_collect = "warn"
-#if_not_else = "warn" # not always an improvement; should be upheld in spirit
-inefficient_to_string = "warn"
-invalid_upcast_comparisons = "warn"
-items_after_statements = "warn"
-large_digit_groups = "warn"
-macro_use_imports = "warn"
-manual_assert = "warn"
-manual_instant_elapsed = "warn"
-manual_let_else = "warn"
-manual_ok_or = "warn"
-many_single_char_names = "warn"
-match_wild_err_arm = "warn"
-match_wildcard_for_single_variants = "warn"
-mismatching_type_param_order = "warn"
-mut_mut = "warn"
-needless_continue = "warn"
-needless_for_each = "warn"
-needless_if = "warn"
-no_effect_underscore_binding = "warn"
-option_option = "warn"
-redundant_else = "warn"
-ref_binding_to_reference = "warn"
-ref_option_ref = "warn"
-same_functions_in_if_condition = "warn"
-unchecked_duration_subtraction = "warn"
-uninlined_format_args = "allow"
-unnecessary_box_returns = "warn"
-unnecessary_join = "warn"
-unnecessary_wraps = "warn"
-unnested_or_patterns = "warn"
-unused_async = "warn"
-used_underscore_binding = "warn"
-verbose_bit_mask = "warn"
+default-run = "neptune-core"
 
-# `opt-level = 3` is needed because it otherwise takes too long to sign
-# transaction with STARK proofs. The other flags are there to make compilation
-# of Triton VM faster.
-[profile.dev.package.triton-vm]
-opt-level = 0
-debug = false
-incremental = true
-debug-assertions = false
-overflow-checks = false
+[features]
 
-[profile.release.package.triton-vm]
-opt-level = 3
-debug = false
-incremental = false
-debug-assertions = false
-overflow-checks = false
+# logs write-lock acquisitions that are held over 100 millis.  requires nightly.
+# to enable: cargo +nightly build --features log-slow-write-lock
+# note: nothing logged until lock is released (guard dropped)
+# alternative: run tokio-console
+log-slow-write-lock = ["track-lock-location", "track-lock-time"]
 
-[profile.bench.package.triton-vm]
-opt-level = 3
-debug = false
-incremental = false
-debug-assertions = false
-overflow-checks = false
+# logs read-lock acquisitions that are held over 100 millis.  requires nightly.
+# to enable: cargo +nightly build --features log-slow-read-lock
+# note: nothing logged until lock is released (guard dropped)
+# alternative: run tokio-console
+log-slow-read-lock = ["track-lock-location", "track-lock-time"]
 
-[profile.test.package.triton-vm]
-opt-level = 1
-debug = false
-incremental = true
-debug-assertions = false
-overflow-checks = false
+# logs all lock events (try_acquire, acquire, release).
+# useful for debugging deadlocks, or if a lock is never being released.
+# includes acquisition location if track-lock-location feature is enabled.
+# alternative: run tokio-console
+log-lock_events = ["track-lock-location"]
 
-# Set to make compilation of Triton VM faster. Since it uses build scripts
-# that should run with `opt-level=3` set.
-[profile.test]
-build-override.opt-level = 3
-opt-level = 2                # Set to make execution of tests in this crate faster. Cf: https://github.com/Neptune-Crypto/neptune-core/issues/204
+# locks::sync::tokio support for tracking location of lock acquisition
+# requires nightly.  not generally useful by itself.
+track-lock-location = []
 
-[profile.release]
-build-override.opt-level = 3
+# locks::sync::tokio support for tracking instant of lock acquisition
+# not generally useful by itself.
+track-lock-time = []
 
-[profile.bench]
-build-override.opt-level = 3
+# implements arbitrary::Arbitrary for various types
+arbitrary-impls = ["dep:arbitrary", "dep:proptest-arbitrary-interop", "dep:proptest"]
 
-[profile.dev]
-build-override.opt-level = 3
+# for sending trace events to tokio-console utility
+tokio-console = ["dep:console-subscriber"]
 
-# The profile that 'dist' will build with
-[profile.dist]
-inherits = "release"
-lto = "thin"
+# Implements `StandardUniform: Distribution<T>` for various types `T` that are
+# served through the RPC interface. Enables the RPC interface to be mocked on
+# the client side.
+mock-rpc = []
+
+[dependencies]
+
+# note: arbitrary, proptest, proptest-arbitrary-interop are duplicated in [dev-dependencies]
+# because they are optional deps but required for unit tests.
+# please ensure versions match in both sections.
+
+aead = { version = "0.5", features = ["std"] }
+aes-gcm = "0.10"
+anyhow = { version = "1.0", features = ["backtrace"] }
+arbitrary = { version = "1.4.1", features = ["derive"], optional = true }
+arraystring = { version = "0.3.0", features = ["serde-traits"] }
+bech32 = ">=0.9, <0.10"
+bincode = "1.3"
+bytes = "1.8"
+bytesize = "1.3"
+chrono = "^0.4.34"
+clap = { version = "4.5", features = ["derive"] }
+console-subscriber = { version = "0.2", optional = true }
+directories = "5.0"
+field_count = "0.1"
+futures = "0.3"
+get-size2 = { version = "0.7", features = ["derive"] }
+itertools = "0.11"
+memmap2 = "0.9"
+num-bigint = { version = "0.4", features = ["serde"] }
+num-rational = "0.4"
+num-traits = "0.2"
+priority-queue = "1.4"
+proptest = { version = "1.7", optional = true }
+proptest-arbitrary-interop = { version = "0.1", optional = true }
+rand = "0.9"
+regex = "1.11.0"
+semver = "^1.0.23"
+serde = { version = "1.0", features = ["derive"] }
+serde_arrays = "0.2"
+serde_derive = "1.0"
+serde_json = "1.0"
+strum = { version = "0.27.0", features = ["derive"] }
+strum_macros = "0.27.0"
+tarpc = { version = "^0.34", features = [
+    "tokio1",
+    "serde-transport",
+    "serde-transport-json",
+    "tcp",
+] }
+tasm-lib = "1.0.0"
+tiny-bip39 = "1.0"
+tokio = { version = "1.41", features = ["full", "tracing"] }
+tokio-serde = { version = "0.8", features = ["bincode", "json"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["std", "env-filter", "time", "fmt"] }
+tracing-test = "0.2"
+zeroize = "1.8.1"
+rs-leveldb = "0.1.5"
+leveldb-sys = "2.0.9"
+async-trait = "0.1.83"
+async-stream = "0.3.6"
+sha3 = "0.10.8"
+readonly = "0.2.12"
+thiserror = "1.0.65"
+systemstat = "0.2.3"
+sysinfo = "0.31.4"
+thread-priority = "1.2.0"
+rayon = "1.10"
+humantime = "2.1.0"
+neptune-rpc-macros = { path = "macros" }
+axum = "0.8.4"
+serde_tuple = "1.1.2"
+hex = "0.4.3"
+
+[dev-dependencies]
+
+# note: arbitrary, proptest, proptest-arbitrary-interop are duplicated in [dev-dependencies]
+# because they are optional deps but required for unit tests.
+# please ensure versions match in both sections.
+
+arbitrary = { version = "1.4.1", features = ["derive"] }
+assert2 = "0.3"
+blake3 = "1.5.4"
+clienter = "0.1.1"
+divan = "0.1.14"
+macro_rules_attr = "0.1.3"
+proptest = { version = "1.7" }
+proptest-arbitrary-interop = { version = "0.1" }
+rand_distr = "0.5"
+rayon = "1.10"
+statrs = "0.18.0"
+test-strategy = "0.3"
+tokio-test = "0.4"
+
+[[bin]]
+name = "neptune-core"
+path = "src/main.rs"
+
+#[lints]
+#workspace = true
+
+## We use harness = false on these so that the divan reports are output on stdout.
+
+[[bench]]
+name = "sync_atomic"
+path = "benchmark/benches/sync_atomic.rs"
+harness = false
+
+[[bench]]
+name = "db_leveldb"
+path = "benchmark/benches/db_leveldb.rs"
+harness = false
+
+[[bench]]
+name = "db_dbtvec"
+path = "benchmark/benches/db_dbtvec.rs"
+harness = false
+
+[[bench]]
+name = "archival_mmr"
+path = "benchmark/benches/archival_mmr.rs"
+harness = false
+
+[[bench]]
+name = "consensus"
+path = "benchmark/benches/consensus.rs"
+harness = false
+required-features = ["arbitrary-impls"]
+
+[[bench]]
+name = "fast_kernel_mast_hash"
+path = "benchmark/benches/fast_kernel_mast_hash.rs"
+harness = false
+
+[[bench]]
+name = "set_new_tip"
+path = "benchmark/benches/set_new_tip.rs"
+harness = false
+
+[[bench]]
+name = "wallet_state"
+path = "benchmark/benches/wallet_state.rs"
+harness = false
+
+[lints.rust]
+unexpected_cfgs = "allow"
+deprecated = "allow"

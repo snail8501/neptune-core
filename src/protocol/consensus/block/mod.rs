@@ -941,7 +941,7 @@ impl Block {
 
     /// Produce the MAST authentication paths for the `pow` field on
     /// [`BlockHeader`], against the block MAST hash.
-    pub(crate) fn pow_mast_paths(&self) -> PowMastPaths {
+    pub fn pow_mast_paths(&self) -> PowMastPaths {
         let pow = BlockHeader::mast_path(self.header(), BlockHeaderField::Pow)
             .try_into()
             .unwrap();
@@ -1001,7 +1001,7 @@ impl Block {
     }
 
     /// Verify that block digest is less than threshold and integral.
-    fn pow_verify(&self, target: Digest) -> bool {
+    pub fn pow_verify(&self, target: Digest) -> bool {
         let auth_paths = self.pow_mast_paths();
         self.header().pow.validate(auth_paths, target).is_ok()
     }
