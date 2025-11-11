@@ -71,7 +71,7 @@ use tracing::info;
 use triton_vm::prelude::BFieldElement;
 
 use crate::application::config::data_directory::DataDirectory;
-use crate::application::json_rpc::server::http::RpcServer;
+use crate::application::json_rpc::server::rpc::RpcServer;
 use crate::application::locks::tokio as sync_tokio;
 use crate::application::loops::channel::MainToMiner;
 use crate::application::loops::channel::MainToPeerTask;
@@ -102,6 +102,12 @@ const _MIN_PTR_WIDTH: () = {
     #[cfg(target_pointer_width = "16")]
     compile_error!("This crate requires a target pointer width of at least 32 bits.");
 };
+
+pub const NEPTUNE_BANNER: &str = include_str!("assets/neptune-banner.txt");
+
+pub fn display_banner() {
+    println!("{}", NEPTUNE_BANNER);
+}
 
 pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
     async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
@@ -285,8 +291,8 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
         let json_rpc_state_lock = global_state_lock.clone();
 
         let json_rpc_join_handle = tokio::spawn(async move {
-            let rpc_server = RpcServer::new(json_rpc_state_lock);
-            rpc_server.serve(listener).await;
+            let rpc_server = RpcServer::new(json_rpc_state_lock, None);
+            rpc_server.serve_http(listener).await;
         });
         task_join_handles.push(json_rpc_join_handle);
 

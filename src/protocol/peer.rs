@@ -105,6 +105,7 @@ pub enum NegativePeerSanction {
     /// from same peer, as they're expensive (in disk I/O and networking
     /// bandwidth) to respond to.
     ReceivedSyncChallenge,
+    UnrelayableTransaction,
 }
 
 /// The reason for improving a peer's standing
@@ -177,6 +178,7 @@ impl Display for NegativePeerSanction {
             NegativePeerSanction::FishyPowEvolutionChallengeResponse => "fishy pow evolution",
             NegativePeerSanction::FishyDifficultiesChallengeResponse => "fishy difficulties",
             NegativePeerSanction::ReceivedSyncChallenge => "received sync challenge",
+            NegativePeerSanction::UnrelayableTransaction => "unrelayable transaction",
         };
         write!(f, "{string}")
     }
@@ -253,6 +255,7 @@ impl Sanction for NegativePeerSanction {
             NegativePeerSanction::FishyPowEvolutionChallengeResponse => -51,
             NegativePeerSanction::FishyDifficultiesChallengeResponse => -51,
             NegativePeerSanction::ReceivedSyncChallenge => -50,
+            NegativePeerSanction::UnrelayableTransaction => -10,
         }
     }
 }
@@ -1013,6 +1016,9 @@ impl rand::distr::Distribution<NegativePeerSanction> for rand::distr::StandardUn
             31 => NegativePeerSanction::UnwantedMessage,
 
             32 => NegativePeerSanction::NoStandingFoundMaybeCrash,
+
+            33 => NegativePeerSanction::ReceivedSyncChallenge,
+            34 => NegativePeerSanction::UnrelayableTransaction,
             _ => unreachable!(),
         }
     }
@@ -1059,7 +1065,7 @@ impl rand::distr::Distribution<PeerStanding> for rand::distr::StandardUniform {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use macro_rules_attr::apply;
-    use rand::random;
+    use rand::{random, rng};
 
     use super::*;
     use crate::protocol::consensus::block::block_header::HeaderToBlockHashWitness;
@@ -1137,6 +1143,17 @@ mod tests {
                 tip.hash(),
                 &invalid_pow_chain
             ));
+        }
+    }
+
+    #[test]
+    fn random_negative_peer_sanction_does_not_crash() {
+        println!(
+            "FYI the number of variants in NegativePeerSanction is {}",
+            <NegativePeerSanction as strum::EnumCount>::COUNT
+        );
+        for _ in 0..200 {
+            let _nps = rng().random::<NegativePeerSanction>();
         }
     }
 }

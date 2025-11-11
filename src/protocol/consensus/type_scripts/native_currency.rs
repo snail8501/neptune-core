@@ -532,7 +532,7 @@ impl ConsensusProgram for NativeCurrency {
             hint coinbase = stack[0..4]
             // _ [txkmh] *ncw *fee [total_input] [total_output] [timelocked_amount] [coinbase]
 
-            /* If coinbase is non-zero assert that at least half output is timelocked */
+            /* If coinbase is non-zero assert that at least half of total output is timelocked */
             push 0
             push 0
             push 0
@@ -922,7 +922,8 @@ pub mod tests {
                 "fee exceeds amount upper bound"
             );
 
-            // if coinbase is set, verify that half of it is time-locked
+            // if coinbase is set, verify that half of total output is
+            // time-locked.
             if some_coinbase.is_positive() {
                 let mut required_timelocked = total_output;
                 required_timelocked.div_two();
@@ -1051,6 +1052,54 @@ pub mod tests {
                 .current();
             prop_inflation_violation_when_fee_too_big(coinbase_pw)
         }
+    }
+
+    #[test]
+    fn very_negative_fee_allowed() {
+        // Since the block validity rules require that the fee is non-negative,
+        // it's OK that it's posssible to inflate supply internally to a
+        // transaction as long as you end up with a transaction with a negative
+        // fee. Since:
+        //   a) mining this transaction directly is not possible
+        //   b) merging this transaction with another must result in a
+        //      transaction with a non-negative fee. So a negative fee in one
+        //      transaction must be cancelled by a equally-sized positive fee
+        //      in the other transaction, and this positive fee must be paid for
+        //      by offsetting the inflation created in this transaction.
+        let input =
+            Utxo::new_native_currency(Digest::default(), NativeCurrencyAmount::from_nau(1_000));
+        let output = Utxo::new_native_currency(
+            Digest::default(),
+            NativeCurrencyAmount::from_nau(167_999_999_999_999_999_999_999_999_999_999_999_999i128),
+        );
+        let fee = NativeCurrencyAmount::from_nau(
+            -167_999_999_999_999_999_999_999_999_999_999_998_999i128,
+        );
+
+        // Ensure kernel has no coinbase and correct fee.
+        let mut test_runner = TestRunner::deterministic();
+        let kernel = arb::<TransactionKernel>()
+            .new_tree(&mut test_runner)
+            .unwrap()
+            .current();
+        let kernel = TransactionKernelModifier::default()
+            .fee(fee)
+            .coinbase(None)
+            .clone_modify(&kernel);
+
+        let very_negative_fee = NativeCurrencyWitness {
+            salted_input_utxos: SaltedUtxos {
+                utxos: vec![input],
+                salt: Default::default(),
+            },
+            salted_output_utxos: SaltedUtxos {
+                utxos: vec![output],
+                salt: Default::default(),
+            },
+            kernel,
+        };
+
+        assert_both_rust_and_tasm_halt_gracefully(very_negative_fee).unwrap();
     }
 
     #[proptest(cases = 30)]
@@ -1425,11 +1474,16 @@ pub mod tests {
         mut primitive_witness: PrimitiveWitness,
         #[strategy(arb())] delta: NativeCurrencyAmount,
     ) {
-        // Modify the kernel so as to increase the coinbase but not the fee. The
+        assert_both_rust_and_tasm_halt_gracefully(NativeCurrencyWitness::from(
+            primitive_witness.clone(),
+        ))?;
+
+        // Modify the kernel so as to change the coinbase but not the fee. The
         // resulting transaction is imbalanced. The amount timelocked is
-        // correct, so this run must fail on the no inflation violation. The
-        // no inflation check disallows *any* imbalance, so total output amount
-        // can neither be too big, nor too small.
+        // correct, since required timelocked amount is calculated by dividing
+        // total output with 2. So this run must fail on the no inflation
+        // violation. The no inflation check disallows *any* imbalance, so total
+        // output amount can neither be too big, nor too small.
 
         // Another test handles negative coinbase amounts.
         let coinbase = primitive_witness.kernel.coinbase.unwrap();
