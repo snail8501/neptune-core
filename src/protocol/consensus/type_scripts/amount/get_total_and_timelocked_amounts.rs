@@ -14,14 +14,14 @@ pub struct GetTotalAndTimeLockedAmounts {
 }
 
 impl BasicSnippet for GetTotalAndTimeLockedAmounts {
-    fn inputs(&self) -> Vec<(DataType, String)> {
+    fn parameters(&self) -> Vec<(DataType, String)> {
         vec![
             (DataType::VoidPointer, "*list_of_utxos".to_string()),
             (DataType::Bfe, "release_date".to_string()),
         ]
     }
 
-    fn outputs(&self) -> Vec<(DataType, String)> {
+    fn return_values(&self) -> Vec<(DataType, String)> {
         vec![
             (DataType::U128, "total_amount".to_string()),
             (DataType::U128, "total_timelocked".to_string()),
@@ -118,7 +118,7 @@ mod test {
     use crate::protocol::consensus::transaction::utxo::Coin;
     use crate::protocol::consensus::transaction::utxo::Utxo;
     use crate::protocol::consensus::type_scripts::time_lock::TimeLock;
-    use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+    use crate::protocol::proof_abstractions::tasm::program::TritonProgram;
 
     impl Algorithm for GetTotalAndTimeLockedAmounts {
         fn rust_shadow(

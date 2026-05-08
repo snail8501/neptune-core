@@ -18,8 +18,8 @@ use crate::protocol::consensus::transaction::transaction_kernel::TransactionKern
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelProxy;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
-use crate::state::wallet::transaction_input::TxInputList;
 use crate::state::wallet::transaction_output::TxOutputList;
+use crate::state::wallet::unlocked_utxo::TxInputs;
 use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
 
 /// contains the unblinded data that a
@@ -43,7 +43,7 @@ use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulat
 /// security: This type contains secrets (keys) and should never be shared.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionDetails {
-    pub tx_inputs: TxInputList,
+    pub tx_inputs: TxInputs,
     pub tx_outputs: TxOutputList,
 
     /// announcements *excluding* encrypted UTXO notifications.
@@ -85,7 +85,7 @@ impl Display for TransactionDetails {
                 .unwrap_or("-".to_string()),
             self.tx_inputs
                 .iter()
-                .map(|o| o.native_currency_amount())
+                .map(|o| o.get_native_currency_amount())
                 .join(", "),
             self.tx_outputs
                 .iter()
@@ -136,7 +136,7 @@ impl TransactionDetails {
     ///
     /// - If the supplied fee is negative.
     /// - If UtxoNotifyMethod is set to none
-    pub(crate) fn fee_gobbler(
+    pub fn fee_gobbler(
         gobbled_fee: NativeCurrencyAmount,
         sender_randomness: Digest,
         mutator_set_accumulator: MutatorSetAccumulator,
@@ -175,7 +175,7 @@ impl TransactionDetails {
         };
 
         TransactionDetails::new_without_coinbase(
-            TxInputList::empty(),
+            TxInputs::empty(),
             gobbling_utxos,
             -gobbled_fee,
             now,
@@ -189,11 +189,9 @@ impl TransactionDetails {
     ///
     /// Does sanity checks on:
     /// - amounts, must be balanced
-    /// - mutator set membership proofs, must be valid wrt. supplied mutator set
     ///
     /// See also: [Self::new_without_coinbase].
     pub(crate) fn new_with_coinbase(
-        tx_inputs: impl Into<TxInputList>,
         tx_outputs: impl Into<TxOutputList>,
         coinbase: NativeCurrencyAmount,
         fee: NativeCurrencyAmount,
@@ -201,8 +199,9 @@ impl TransactionDetails {
         mutator_set_accumulator: MutatorSetAccumulator,
         network: Network,
     ) -> Self {
+        let inputs = TxInputs::empty();
         Self::new(
-            tx_inputs,
+            inputs,
             tx_outputs,
             fee,
             Some(coinbase),
@@ -218,10 +217,8 @@ impl TransactionDetails {
     /// Does sanity checks on:
     /// - amounts, must be balanced
     /// - mutator set membership proofs, must be valid wrt. supplied mutator set
-    ///
-    /// See also: [Self::new_with_coinbase].
-    pub(crate) fn new_without_coinbase(
-        tx_inputs: impl Into<TxInputList>,
+    pub fn new_without_coinbase(
+        tx_inputs: impl Into<TxInputs>,
         tx_outputs: impl Into<TxOutputList>,
         fee: NativeCurrencyAmount,
         timestamp: Timestamp,
@@ -243,7 +240,7 @@ impl TransactionDetails {
     ///
     /// This fn does not perform any validation.  use validate() instead.
     pub(crate) fn new(
-        tx_inputs: impl Into<TxInputList>,
+        tx_inputs: impl Into<TxInputs>,
         tx_outputs: impl Into<TxOutputList>,
         fee: NativeCurrencyAmount,
         coinbase: Option<NativeCurrencyAmount>,
@@ -268,13 +265,13 @@ impl TransactionDetails {
     /// Use this method for announcements that are *not* encrypted UTXO
     /// notifications.
     ///
-    /// Announcements are not part of the main constructor [`Self::new`]
+    /// Announcements are not part of the main constructor `Self::new`
     /// because in the common case they are not necessary. If there are
     /// encrypted UTXO notifications, these are computed on the fly from the
     /// transaction outputs. This function should only be used for
     /// announcements that are not encrypted UTXO notifications, which is an
     /// exceptional case.
-    pub(crate) fn with_announcements<Iter: IntoIterator<Item = Announcement>>(
+    pub fn with_announcements<Iter: IntoIterator<Item = Announcement>>(
         mut self,
         announcements: Iter,
     ) -> Self {
@@ -284,6 +281,14 @@ impl TransactionDetails {
             .chain(announcements)
             .collect_vec();
         self
+    }
+
+    /// Returns true if the (presumably locally produced) transaction contains
+    /// lustration announcements.
+    pub fn contains_lustrations(&self) -> bool {
+        self.announcements()
+            .iter()
+            .any(|x| x.looks_like_lustration())
     }
 
     /// amount spent (excludes change and fee)

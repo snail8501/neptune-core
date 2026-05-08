@@ -42,7 +42,7 @@ pub struct TxOutput {
 
 impl TxOutput {
     // note: normally use one of the other constructors.
-    pub(crate) fn new(
+    pub fn new(
         utxo: Utxo,
         sender_randomness: Digest,
         receiver_digest: Digest,
@@ -229,7 +229,7 @@ impl TxOutput {
 
     /// Instantiate a [TxOutput] for native currency intended fro on-chain UTXO
     /// notification.
-    pub(crate) fn onchain_native_currency(
+    pub fn onchain_native_currency(
         amount: NativeCurrencyAmount,
         sender_randomness: Digest,
         receiving_address: ReceivingAddress,
@@ -266,7 +266,7 @@ impl TxOutput {
 
     /// Instantiate a [TxOutput] for native currency intended for off-chain UTXO
     /// notification.
-    pub(crate) fn offchain_native_currency(
+    pub fn offchain_native_currency(
         amount: NativeCurrencyAmount,
         sender_randomness: Digest,
         receiving_address: ReceivingAddress,
@@ -347,16 +347,27 @@ impl TxOutput {
         )
     }
 
-    pub(crate) fn utxo(&self) -> Utxo {
+    pub fn utxo(&self) -> Utxo {
         self.utxo.clone()
     }
 
-    pub(crate) fn sender_randomness(&self) -> Digest {
+    #[inline(always)]
+    pub fn sender_randomness(&self) -> Digest {
         self.sender_randomness
     }
 
-    pub(crate) fn receiver_digest(&self) -> Digest {
+    pub fn set_sender_randomness(&mut self, sender_randomness: Digest) {
+        self.sender_randomness = sender_randomness;
+    }
+
+    #[inline(always)]
+    pub fn receiver_digest(&self) -> Digest {
         self.receiver_digest
+    }
+
+    #[inline(always)]
+    pub(crate) fn notification_method(&self) -> &UtxoNotificationMethod {
+        &self.notification_method
     }
 
     /// Retrieve on-chain UTXO notification announcement, if any.
@@ -688,7 +699,7 @@ mod tests {
         .await;
 
         let state = global_state_lock.lock_guard().await;
-        let block_height = state.chain.light_state().header().height;
+        let block_height = state.chain.tip().header().height;
 
         // generate a new receiving address that is not from our wallet.
         let mut rng = rand::rng();
@@ -758,7 +769,7 @@ mod tests {
         let address_sym = spending_key_sym.to_address();
 
         let state = global_state_lock.lock_guard().await;
-        let block_height = state.chain.light_state().header().height;
+        let block_height = state.chain.tip().header().height;
 
         let amount = NativeCurrencyAmount::one_nau();
 

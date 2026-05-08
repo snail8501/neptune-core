@@ -25,7 +25,7 @@ use crate::protocol::consensus::transaction::utxo::Coin;
 use crate::protocol::consensus::transaction::utxo::Utxo;
 use crate::protocol::consensus::type_scripts::TypeScriptAndWitness;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+use crate::protocol::proof_abstractions::tasm::program::TritonProgram;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::protocol::proof_abstractions::SecretWitness;
 
@@ -53,7 +53,7 @@ impl TimeLock {
     }
 }
 
-impl ConsensusProgram for TimeLock {
+impl TritonProgram for TimeLock {
     fn library_and_code(&self) -> (Library, Vec<LabelledInstruction>) {
         let (library, audit_preloaded_data, audit_subroutine) = {
             let mut library = Library::new();
@@ -1012,10 +1012,10 @@ mod tests {
     use super::neptune_arbitrary::arbitrary_primitive_witness_with_expired_timelocks;
     use super::*;
     use crate::protocol::proof_abstractions::tasm::builtins as tasm;
+    use crate::protocol::proof_abstractions::tasm::program::spec::TritonProgramSpecification;
     use crate::protocol::proof_abstractions::tasm::program::tests::test_program_snapshot;
-    use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
 
-    impl ConsensusProgramSpecification for TimeLock {
+    impl TritonProgramSpecification for TimeLock {
         #[expect(clippy::needless_return)]
         fn source(&self) {
             // get in the current program's hash digest

@@ -1,4 +1,4 @@
-pub(crate) mod absolute_index_set;
+pub mod absolute_index_set;
 pub(crate) mod chunk;
 pub(crate) mod chunk_dictionary;
 pub(crate) mod removal_record_list;
@@ -16,7 +16,7 @@ use arbitrary::Result;
 use get_size2::GetSize;
 use itertools::Itertools;
 use serde::Deserialize;
-use serde_derive::Serialize;
+use serde::Serialize;
 use tasm_lib::prelude::Digest;
 use tasm_lib::prelude::Tip5;
 use tasm_lib::structure::tasm_object::TasmObject;
@@ -260,6 +260,16 @@ impl RemovalRecord {
 pub(crate) enum RemovalRecordValidityError {
     AbsentAuthenticatedChunk,
     InvalidSwbfiMmrMp { chunk_index: u64 },
+}
+
+#[cfg(test)]
+impl rand::distr::Distribution<RemovalRecord> for rand::distr::StandardUniform {
+    fn sample<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> RemovalRecord {
+        RemovalRecord {
+            absolute_indices: rng.random(),
+            target_chunks: rng.random(),
+        }
+    }
 }
 
 #[cfg(test)]

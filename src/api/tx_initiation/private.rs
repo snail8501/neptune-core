@@ -27,7 +27,7 @@ impl TransactionInitiatorPrivate {
         let response = self
             .global_state_lock
             .rpc_server_to_main_tx()
-            .send(RPCServerToMain::BroadcastTx(transaction))
+            .send(RPCServerToMain::BroadcastOwnTx(transaction))
             .await;
 
         if let Err(e) = response {
@@ -56,6 +56,10 @@ impl TransactionInitiatorPrivate {
         }
 
         let capability = self.global_state_lock.cli().proving_capability();
+
+        // If machine cannot make proof collection, it cannot get the proof into
+        // a shareable state. So this check is needed to inform the user of this
+        // problem.
         let proof_type = TransactionProofType::ProofCollection;
         let network = self.global_state_lock.cli().network;
         if !network.use_mock_proof() && !capability.can_prove(proof_type) {
@@ -78,11 +82,16 @@ impl TransactionInitiatorPrivate {
         // which is approx 5.6 months after launch.
         // after that, the training wheel come off.
         const RATE_LIMIT_UNTIL_HEIGHT: u64 = 25000;
+
+        if !self.global_state_lock.cli().network.is_main() {
+            return Ok(());
+        }
+
         let state = self.global_state_lock.lock_guard().await;
 
-        if state.chain.light_state().header().height < RATE_LIMIT_UNTIL_HEIGHT.into() {
+        if state.chain.tip().header().height < RATE_LIMIT_UNTIL_HEIGHT.into() {
             const RATE_LIMIT: usize = 2;
-            let tip_digest = state.chain.light_state().hash();
+            let tip_digest = state.chain.tip_hash();
             let send_count_at_tip = state
                 .wallet_state
                 .count_sent_transactions_at_block(tip_digest)
@@ -93,7 +102,7 @@ impl TransactionInitiatorPrivate {
                 RATE_LIMIT
             );
             if send_count_at_tip >= RATE_LIMIT {
-                let height = state.chain.light_state().header().height;
+                let height = state.chain.tip().header().height;
                 let e = error::SendError::RateLimit {
                     height,
                     tip_digest,

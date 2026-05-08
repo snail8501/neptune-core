@@ -8,12 +8,12 @@ use tasm_lib::triton_vm::prelude::*;
 use crate::protocol::consensus::transaction::validity::kernel_to_outputs::KernelToOutputs;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 use crate::protocol::consensus::transaction::validity::tasm::claims::new_claim::NewClaim;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+use crate::protocol::proof_abstractions::tasm::program::TritonProgram;
 
 pub(crate) struct GenerateK2oClaim;
 
 impl BasicSnippet for GenerateK2oClaim {
-    fn inputs(&self) -> Vec<(DataType, String)> {
+    fn parameters(&self) -> Vec<(DataType, String)> {
         vec![
             (DataType::Digest, "transaction_kernel_digest".to_owned()),
             (DataType::Bfe, "garb0".to_string()),
@@ -22,7 +22,7 @@ impl BasicSnippet for GenerateK2oClaim {
         ]
     }
 
-    fn outputs(&self) -> Vec<(DataType, String)> {
+    fn return_values(&self) -> Vec<(DataType, String)> {
         vec![
             (DataType::Digest, "transaction_kernel_digest".to_owned()),
             (DataType::Bfe, "garb0".to_string()),

@@ -21,7 +21,7 @@ use crate::protocol::consensus::transaction::primitive_witness::SaltedUtxos;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelField;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+use crate::protocol::proof_abstractions::tasm::program::TritonProgram;
 use crate::protocol::proof_abstractions::SecretWitness;
 
 #[derive(
@@ -115,7 +115,7 @@ impl KernelToOutputs {
     const INCONSISTENT_LENGTHS: i128 = 1_000_272;
 }
 
-impl ConsensusProgram for KernelToOutputs {
+impl TritonProgram for KernelToOutputs {
     fn library_and_code(&self) -> (Library, Vec<LabelledInstruction>) {
         const MAX_JUMP_LENGTH: usize = 2_000_000;
 
@@ -358,27 +358,16 @@ impl ConsensusProgram for KernelToOutputs {
     }
 }
 
-#[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-mod tests {
-    use proptest::prop_assert_eq;
-    use proptest::strategy::Strategy;
-    use proptest::test_runner::TestRunner;
-    use rand::random;
-    use tasm_lib::triton_vm;
-    use test_strategy::proptest;
-
+#[cfg(any(test, feature = "spec"))]
+mod spec {
     use super::*;
-    use crate::protocol::consensus::transaction::utxo::Utxo;
+    use crate::api::export::AdditionRecord;
+    use crate::api::export::Utxo;
     use crate::protocol::proof_abstractions::tasm::builtins as tasm;
-    use crate::protocol::proof_abstractions::tasm::program::tests::test_program_snapshot;
-    use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
-    use crate::triton_vm::proof::Claim;
-    use crate::triton_vm::stark::Stark;
-    use crate::util_types::mutator_set::addition_record::AdditionRecord;
+    use crate::protocol::proof_abstractions::tasm::program::spec::TritonProgramSpecification;
     use crate::util_types::mutator_set::commit;
 
-    impl ConsensusProgramSpecification for KernelToOutputs {
+    impl TritonProgramSpecification for KernelToOutputs {
         fn source(&self) {
             let txk_digest: Digest = tasm::tasmlib_io_read_stdin___digest();
             let start_address: BFieldElement =
@@ -423,6 +412,23 @@ mod tests {
             tasm::tasmlib_io_write_to_stdout___digest(salted_output_utxos_hash);
         }
     }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use proptest::prop_assert_eq;
+    use proptest::strategy::Strategy;
+    use proptest::test_runner::TestRunner;
+    use rand::random;
+    use tasm_lib::triton_vm;
+    use test_strategy::proptest;
+
+    use super::*;
+    use crate::protocol::proof_abstractions::tasm::program::spec::TritonProgramSpecification;
+    use crate::protocol::proof_abstractions::tasm::program::tests::test_program_snapshot;
+    use crate::triton_vm::proof::Claim;
+    use crate::triton_vm::stark::Stark;
 
     #[proptest(cases = 30)]
     fn kernel_to_outputs_proptest(

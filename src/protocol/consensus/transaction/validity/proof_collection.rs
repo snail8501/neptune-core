@@ -27,7 +27,7 @@ use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::transaction::validity::removal_records_integrity::RemovalRecordsIntegrityWitness;
 use crate::protocol::consensus::transaction::BFieldCodec;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+use crate::protocol::proof_abstractions::tasm::program::TritonProgram;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 use crate::protocol::proof_abstractions::verifier::verify;
 use crate::protocol::proof_abstractions::SecretWitness;
@@ -219,11 +219,10 @@ impl ProofCollection {
         debug!("proving, salted inputs hash: {}", salted_inputs_hash);
         debug!("proving, salted outputs hash: {}", salted_outputs_hash);
 
-        let claim = Claim::new(Digest::default());
         let mock_proof = if valid_mock {
-            Proof::valid_mock(claim)
+            Proof::valid_mock()
         } else {
-            Proof::invalid_mock(claim)
+            Proof::invalid_mock()
         };
 
         let merge_bit_mast_path = primitive_witness
@@ -307,7 +306,7 @@ impl ProofCollection {
                 [self.salted_inputs_hash, self.salted_outputs_hash]
                     .into_iter()
                     .flat_map(|d| d.reversed().values())
-                    .collect_vec(),
+                    .collect::<Vec<_>>(),
             )
             .with_output(
                 self.type_script_hashes
@@ -333,7 +332,7 @@ impl ProofCollection {
                     ]
                     .into_iter()
                     .flat_map(|d| d.reversed().values())
-                    .collect_vec(),
+                    .collect::<Vec<_>>(),
                 )
             })
             .collect_vec();
@@ -486,7 +485,7 @@ pub mod tests {
     use crate::api::export::NativeCurrencyAmount;
     use crate::api::export::NeptuneProof;
     use crate::application::triton_vm_job_queue::vm_job_queue;
-    use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
+    use crate::protocol::proof_abstractions::tasm::program::spec::TritonProgramSpecification;
     use crate::tests::shared_tokio_runtime;
 
     impl ProofCollection {
@@ -584,7 +583,7 @@ pub mod tests {
     impl ProofCollection {
         pub(crate) fn can_produce(primitive_witness: &PrimitiveWitness) -> bool {
             fn witness_halts_gracefully(
-                program: impl ConsensusProgramSpecification,
+                program: impl TritonProgramSpecification,
                 witness: impl SecretWitness,
             ) -> bool {
                 program

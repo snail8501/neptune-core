@@ -2,8 +2,9 @@
 //!
 //! They are exported here in one location for convenience.
 
-pub use crate::api::tx_initiation::builder::tx_input_list_builder::InputSelectionPolicy;
+pub use crate::api::tx_initiation::builder::input_selector::InputSelectionPriority;
 pub use crate::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
+pub use crate::api::tx_initiation::consolidate::ConsolidationError;
 pub use crate::api::wallet::WalletBalances;
 pub use crate::application::config::cli_args::Args;
 pub use crate::application::config::network::Network;
@@ -25,15 +26,19 @@ pub use crate::state::transaction::transaction_details::TransactionDetails;
 pub use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 pub use crate::state::transaction::tx_creation_artifacts::TxCreationArtifacts;
 pub use crate::state::transaction::tx_proving_capability::TxProvingCapability;
+pub use crate::state::wallet::address::announcement_flag::AnnouncementFlag;
 pub use crate::state::wallet::address::generation_address::GenerationSpendingKey;
 pub use crate::state::wallet::address::symmetric_key::SymmetricKey;
 pub use crate::state::wallet::address::KeyType;
 pub use crate::state::wallet::address::ReceivingAddress;
 pub use crate::state::wallet::address::SpendingKey;
 pub use crate::state::wallet::change_policy::ChangePolicy;
-pub use crate::state::wallet::transaction_input::TxInput;
-pub use crate::state::wallet::transaction_input::TxInputList;
+pub use crate::state::wallet::input_candidate::InputCandidate;
 pub use crate::state::wallet::transaction_output::TxOutputList;
+pub use crate::state::wallet::unlocked_utxo::TxInputs;
+pub use crate::state::wallet::unlocked_utxo::UnlockedUtxo;
+pub use crate::state::wallet::utxo_notification::UtxoNotificationMethod;
+pub use crate::state::wallet::wallet_entropy::WalletEntropy;
 pub use crate::state::GlobalStateLock;
 pub use crate::state::RecordTransactionError;
 pub use crate::state::StateLock;
@@ -43,3 +48,4 @@ pub use crate::triton_vm::prelude::Program;
 pub use crate::triton_vm::proof::Claim;
 pub use crate::triton_vm::vm::NonDeterminism;
 pub use crate::util_types::mutator_set::addition_record::AdditionRecord;
+pub use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;

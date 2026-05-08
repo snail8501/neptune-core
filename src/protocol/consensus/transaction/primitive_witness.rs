@@ -20,7 +20,7 @@ use super::transaction_kernel::TransactionKernel;
 use super::transaction_kernel::TransactionKernelModifier;
 use super::utxo::Utxo;
 use super::TransactionDetails;
-use crate::api::export::TxInputList;
+use crate::api::export::TxInputs;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
 use crate::protocol::consensus::type_scripts::known_type_scripts;
 use crate::protocol::consensus::type_scripts::known_type_scripts::match_type_script_and_generate_witness;
@@ -155,7 +155,7 @@ impl PrimitiveWitness {
     /// # Panics
     /// Panics if transaction validity cannot be satisfied.
     fn generate_primitive_witness(
-        unlocked_utxos: &TxInputList,
+        unlocked_utxos: &TxInputs,
         output_utxos: Vec<Utxo>,
         sender_randomnesses: Vec<Digest>,
         receiver_digests: Vec<Digest>,
@@ -229,7 +229,7 @@ impl PrimitiveWitness {
     }
 
     /// Create a [`PrimitiveWitness`] from [`TransactionDetails`].
-    pub(crate) fn from_transaction_details(transaction_details: &TransactionDetails) -> Self {
+    pub fn from_transaction_details(transaction_details: &TransactionDetails) -> Self {
         let kernel = transaction_details.transaction_kernel();
 
         let TransactionDetails {
@@ -362,7 +362,7 @@ impl PrimitiveWitness {
             ]
             .into_iter()
             .flat_map(|d| d.reversed().values())
-            .collect_vec();
+            .collect::<Vec<BFieldElement>>();
             let public_input: PublicInput = public_input.into();
 
             // Like above: potentially lengthy, CPU intensive call, only thing that matters
@@ -1100,7 +1100,7 @@ mod tests {
     use crate::protocol::consensus::type_scripts::time_lock::TimeLock;
     use crate::protocol::consensus::type_scripts::time_lock::TimeLockWitness;
     use crate::protocol::consensus::type_scripts::TypeScriptWitness;
-    use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+    use crate::protocol::proof_abstractions::tasm::program::TritonProgram;
     use crate::protocol::proof_abstractions::timestamp::Timestamp;
     use crate::tests::shared_tokio_runtime;
     use crate::util_types::mutator_set::msa_and_records::MsaAndRecords;
@@ -1136,6 +1136,28 @@ mod tests {
     }
 
     impl PrimitiveWitness {
+        /// Return a primitive witness that's guaranteed to be invalid
+        pub(crate) fn invalid() -> Self {
+            let network = Network::Main;
+            let mutator_set_accumulator = MutatorSetAccumulator::default();
+            let timestamp = network.launch_date();
+            let kernel = TransactionDetails::nop(mutator_set_accumulator, timestamp, network)
+                .transaction_kernel();
+            Self {
+                input_utxos: SaltedUtxos::empty(),
+                input_membership_proofs: vec![],
+                lock_scripts_and_witnesses: vec![],
+                // Invalid because there is no type script. All transactions
+                // must prove to be satisfying the native current type script.
+                type_scripts_and_witnesses: vec![],
+                output_utxos: SaltedUtxos::empty(),
+                output_sender_randomnesses: vec![],
+                output_receiver_digests: vec![],
+                mutator_set_accumulator: MutatorSetAccumulator::default(),
+                kernel,
+            }
+        }
+
         /// Arbitrary with: (num inputs, num outputs, num pub announcements)
         pub(crate) fn arbitrary_tuple_with_matching_mutator_sets<const N: usize>(
             param_sets: [(usize, usize, usize); N],
@@ -1747,6 +1769,12 @@ mod tests {
                 )
                 .boxed()
         }
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn invalid_pw_is_invalid() {
+        let pw = PrimitiveWitness::invalid();
+        assert!(pw.validate().await.is_err());
     }
 
     #[traced_test]

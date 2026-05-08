@@ -11,6 +11,7 @@ use neptune_cash::api::export::Timestamp;
 use neptune_cash::protocol::consensus::block::Block;
 use tasm_lib::twenty_first::bfe;
 use tasm_lib::twenty_first::math::b_field_element::BFieldElement;
+use tracing_test::traced_test;
 
 use crate::common::fetch_files::test_helper_data_dir;
 use crate::common::fetch_files::try_fetch_file_from_server;
@@ -36,6 +37,7 @@ pub fn genesis_block_hasnt_changed_testnet_0() {
 
 /// test: Verify that first ~250 blocks on main net are still considered valid,
 /// and that a global state can be restored from it.
+#[traced_test]
 #[tokio::test(flavor = "multi_thread")]
 async fn can_restore_from_real_mainnet_data_with_reorganizations() {
     logging::tracing_logger();
@@ -68,7 +70,7 @@ async fn can_restore_from_real_mainnet_data_with_reorganizations() {
         .import_blocks_from_directory(&test_data_dir, 0, validate_blocks)
         .await
         .unwrap();
-    let restored_block_height = state.chain.light_state().header().height;
+    let restored_block_height = state.chain.tip().header().height;
     println!("restored_block_height: {restored_block_height}");
     assert_eq!(
         BlockHeight::new(bfe!(250)),
@@ -79,11 +81,21 @@ async fn can_restore_from_real_mainnet_data_with_reorganizations() {
     // Verify that wallet state was handled correctly, that balance is still
     // premine reward, since the devnet reward was not spent during first
     // blocks.
+    let final_height = state.chain.tip().header().height;
     let wallet_status = state.get_wallet_status_for_tip().await;
-    let balance = wallet_status.available_confirmed(network.launch_date() + Timestamp::months(7));
+    let balance = wallet_status
+        .confirmed_available_balance(final_height, network.launch_date() + Timestamp::months(7));
     assert_eq!(
         NativeCurrencyAmount::coins(20),
         balance,
         "Expected balance must be available after state-recovery"
     );
+
+    drop(state);
+
+    assert!(alice
+        .gsl
+        .revalidate_canonical_chain(BlockHeight::genesis(), final_height)
+        .await
+        .is_ok());
 }

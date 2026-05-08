@@ -40,6 +40,7 @@ use super::consensus::block::Block;
 use super::proof_abstractions::timestamp::Timestamp;
 use crate::application::config::network::Network;
 use crate::application::loops::channel::BlockProposalNotification;
+use crate::application::loops::sync_loop::synchronization_bit_mask::SynchronizationBitMask;
 use crate::protocol::consensus::block::difficulty_control::max_cumulative_pow_after;
 use crate::protocol::peer::transfer_block::TransferBlock;
 use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
@@ -54,7 +55,7 @@ pub(crate) trait Sanction {
 }
 
 /// The reason for degrading a peer's standing
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, strum::Display)]
 #[cfg_attr(any(test, feature = "mock-rpc"), derive(strum::EnumCount))]
 pub enum NegativePeerSanction {
     InvalidBlock((BlockHeight, Digest)),
@@ -87,6 +88,9 @@ pub enum NegativePeerSanction {
     TransactionWithNegativeFee,
     DoubleSpendingTransaction,
     CannotApplyTransactionToMutatorSet,
+    OversizedAnnouncement,
+    /// Block exceeds size limit during fork reconciliation (RAM exhaustion attack)
+    OversizedBlock,
 
     InvalidBlockMmrAuthentication,
 
@@ -96,6 +100,8 @@ pub enum NegativePeerSanction {
     InvalidBlockProposal,
     NonFavorableBlockProposal,
     BlockProposalFromBlockedPeer,
+    RequestForUnknownBlock,
+    RequestForGenesisBlock,
 
     UnwantedMessage,
 
@@ -106,10 +112,17 @@ pub enum NegativePeerSanction {
     /// bandwidth) to respond to.
     ReceivedSyncChallenge,
     UnrelayableTransaction,
+
+    /// A transaction was missing lustration announcements
+    MissingLustrationAnnouncement,
+
+    /// A transaction was received that would make the lustration counter
+    /// negative.
+    LustrationsWouldMakeCounterNegative,
 }
 
 /// The reason for improving a peer's standing
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, strum::Display)]
 #[cfg_attr(any(test, feature = "mock-rpc"), derive(strum::EnumCount))]
 pub enum PositivePeerSanction {
     // positive sanctions (standing-improving)
@@ -121,101 +134,6 @@ pub enum PositivePeerSanction {
     NewBlockProposal,
 }
 
-impl Display for NegativePeerSanction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let string = match self {
-            NegativePeerSanction::InvalidBlock(_) => "invalid block",
-            NegativePeerSanction::DifferentGenesis => "different genesis",
-            NegativePeerSanction::ForkResolutionError(_) => "fork resolution error",
-            NegativePeerSanction::SynchronizationTimeout => "synchronization timeout",
-            NegativePeerSanction::FloodPeerListResponse => "flood peer list response",
-            NegativePeerSanction::BlockRequestUnknownHeight => "block request unknown height",
-            NegativePeerSanction::InvalidMessage => "invalid message",
-            NegativePeerSanction::TooShortBlockBatch => "too short block batch",
-            NegativePeerSanction::ReceivedBatchBlocksOutsideOfSync => {
-                "received block batch outside of sync"
-            }
-            NegativePeerSanction::BatchBlocksInvalidStartHeight => {
-                "invalid start height of batch blocks"
-            }
-            NegativePeerSanction::BatchBlocksUnknownRequest => "batch blocks unknown request",
-            NegativePeerSanction::InvalidTransaction => "invalid transaction",
-            NegativePeerSanction::UnconfirmableTransaction => "unconfirmable transaction",
-            NegativePeerSanction::TransactionWithNegativeFee => "negative-fee transaction",
-            NegativePeerSanction::DoubleSpendingTransaction => "double-spending transaction",
-            NegativePeerSanction::CannotApplyTransactionToMutatorSet => {
-                "cannot apply tx to mutator set"
-            }
-            NegativePeerSanction::NonMinedTransactionHasCoinbase => {
-                "non-mined transaction has coinbase"
-            }
-            NegativePeerSanction::NoStandingFoundMaybeCrash => {
-                "No standing found in map. Did peer task crash?"
-            }
-            NegativePeerSanction::BlockProposalNotFound => "Block proposal not found",
-            NegativePeerSanction::InvalidBlockProposal => "Invalid block proposal",
-            NegativePeerSanction::UnwantedMessage => "unwanted message",
-            NegativePeerSanction::NonFavorableBlockProposal => "non-favorable block proposal",
-            NegativePeerSanction::BlockProposalFromBlockedPeer => {
-                "got block proposal from non-whitelisted peer"
-            }
-            NegativePeerSanction::BatchBlocksRequestEmpty => "batch block request empty",
-            NegativePeerSanction::InvalidSyncChallenge => "invalid sync challenge",
-            NegativePeerSanction::InvalidSyncChallengeResponse => "invalid sync challenge response",
-            NegativePeerSanction::UnexpectedSyncChallengeResponse => {
-                "unexpected sync challenge response"
-            }
-            NegativePeerSanction::InvalidTransferBlock => "invalid transfer block",
-            NegativePeerSanction::TimedOutSyncChallengeResponse => {
-                "timed-out sync challenge response"
-            }
-            NegativePeerSanction::InvalidBlockMmrAuthentication => {
-                "invalid block mmr authentication"
-            }
-            NegativePeerSanction::BatchBlocksRequestTooManyDigests => {
-                "too many digests in batch block request"
-            }
-            NegativePeerSanction::FishyPowEvolutionChallengeResponse => "fishy pow evolution",
-            NegativePeerSanction::FishyDifficultiesChallengeResponse => "fishy difficulties",
-            NegativePeerSanction::ReceivedSyncChallenge => "received sync challenge",
-            NegativePeerSanction::UnrelayableTransaction => "unrelayable transaction",
-        };
-        write!(f, "{string}")
-    }
-}
-
-impl Display for PositivePeerSanction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let string = match self {
-            PositivePeerSanction::ValidBlocks(_) => "valid blocks",
-            PositivePeerSanction::NewBlockProposal => "new block proposal",
-        };
-        write!(f, "{string}")
-    }
-}
-
-/// Used by main task to manage synchronizations/catch-up. Main task has
-/// a value of this type for each connected peer.
-
-#[derive(Debug, Clone, Copy)]
-pub struct PeerSynchronizationState {
-    pub claimed_max_height: BlockHeight,
-    pub(crate) claimed_max_pow: ProofOfWork,
-    pub synchronization_start: SystemTime,
-    pub last_request_received: Option<SystemTime>,
-}
-
-impl PeerSynchronizationState {
-    pub(crate) fn new(claimed_max_height: BlockHeight, claimed_max_pow: ProofOfWork) -> Self {
-        Self {
-            claimed_max_height,
-            claimed_max_pow,
-            synchronization_start: SystemTime::now(),
-            last_request_received: None,
-        }
-    }
-}
-
 impl Sanction for NegativePeerSanction {
     fn severity(self) -> i32 {
         match self {
@@ -224,9 +142,9 @@ impl Sanction for NegativePeerSanction {
             NegativePeerSanction::ForkResolutionError((_height, count, _digest)) => {
                 i32::from(count).saturating_mul(-1)
             }
-            NegativePeerSanction::SynchronizationTimeout => -5,
+            NegativePeerSanction::SynchronizationTimeout => -2,
             NegativePeerSanction::FloodPeerListResponse => -2,
-            NegativePeerSanction::InvalidMessage => -2,
+            NegativePeerSanction::InvalidMessage => -1,
             NegativePeerSanction::TooShortBlockBatch => -2,
             NegativePeerSanction::ReceivedBatchBlocksOutsideOfSync => -2,
             NegativePeerSanction::BatchBlocksInvalidStartHeight => -2,
@@ -237,25 +155,31 @@ impl Sanction for NegativePeerSanction {
             NegativePeerSanction::TransactionWithNegativeFee => -22,
             NegativePeerSanction::DoubleSpendingTransaction => -14,
             NegativePeerSanction::CannotApplyTransactionToMutatorSet => -3,
+            NegativePeerSanction::OversizedAnnouncement => -10,
+            NegativePeerSanction::OversizedBlock => -50,
             NegativePeerSanction::NonMinedTransactionHasCoinbase => -10,
             NegativePeerSanction::NoStandingFoundMaybeCrash => -10,
             NegativePeerSanction::BlockProposalNotFound => -1,
-            NegativePeerSanction::InvalidBlockProposal => -10,
+            NegativePeerSanction::InvalidBlockProposal => -3,
+            NegativePeerSanction::RequestForUnknownBlock => -5,
+            NegativePeerSanction::RequestForGenesisBlock => -100,
             NegativePeerSanction::UnwantedMessage => -1,
             NegativePeerSanction::NonFavorableBlockProposal => -1,
             NegativePeerSanction::BlockProposalFromBlockedPeer => -10,
             NegativePeerSanction::BatchBlocksRequestEmpty => -10,
             NegativePeerSanction::InvalidSyncChallenge => -50,
-            NegativePeerSanction::InvalidSyncChallengeResponse => -500,
+            NegativePeerSanction::InvalidSyncChallengeResponse => -300,
             NegativePeerSanction::UnexpectedSyncChallengeResponse => -1,
             NegativePeerSanction::InvalidTransferBlock => -50,
-            NegativePeerSanction::TimedOutSyncChallengeResponse => -50,
+            NegativePeerSanction::TimedOutSyncChallengeResponse => -10,
             NegativePeerSanction::InvalidBlockMmrAuthentication => -4,
             NegativePeerSanction::BatchBlocksRequestTooManyDigests => -50,
-            NegativePeerSanction::FishyPowEvolutionChallengeResponse => -51,
-            NegativePeerSanction::FishyDifficultiesChallengeResponse => -51,
-            NegativePeerSanction::ReceivedSyncChallenge => -50,
+            NegativePeerSanction::FishyPowEvolutionChallengeResponse => -21,
+            NegativePeerSanction::FishyDifficultiesChallengeResponse => -21,
+            NegativePeerSanction::ReceivedSyncChallenge => -30,
             NegativePeerSanction::UnrelayableTransaction => -10,
+            NegativePeerSanction::MissingLustrationAnnouncement => -1,
+            NegativePeerSanction::LustrationsWouldMakeCounterNegative => -1,
         }
     }
 }
@@ -301,7 +225,7 @@ pub struct PeerStanding {
     pub standing: i32,
     pub latest_punishment: Option<(NegativePeerSanction, SystemTime)>,
     pub latest_reward: Option<(PositivePeerSanction, SystemTime)>,
-    peer_tolerance: i32,
+    pub(crate) peer_tolerance: i32,
 }
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct StandingExceedsBanThreshold;
@@ -498,6 +422,7 @@ pub(crate) enum PeerMessage {
     /// Inform peer that we are disconnecting them.
     Bye,
     ConnectionStatus(TransferConnectionStatus),
+    SyncCoverage(SynchronizationBitMask),
     // New variants must be added here at the bottom to be backwards compatible.
 }
 
@@ -525,6 +450,7 @@ impl PeerMessage {
             PeerMessage::UnableToSatisfyBatchRequest => "unable to satisfy batch request",
             PeerMessage::SyncChallenge(_) => "sync challenge",
             PeerMessage::SyncChallengeResponse(_) => "sync challenge response",
+            PeerMessage::SyncCoverage(_) => "sync coverage",
         }
         .to_string()
     }
@@ -552,6 +478,7 @@ impl PeerMessage {
             PeerMessage::UnableToSatisfyBatchRequest => true,
             PeerMessage::SyncChallenge(_) => false,
             PeerMessage::SyncChallengeResponse(_) => false,
+            PeerMessage::SyncCoverage(_) => true,
         }
     }
 
@@ -559,7 +486,7 @@ impl PeerMessage {
     pub fn ignore_during_sync(&self) -> bool {
         match self {
             PeerMessage::Handshake { .. } => false,
-            PeerMessage::Block(_) => true,
+            PeerMessage::Block(_) => false,
             PeerMessage::BlockNotificationRequest => false,
             PeerMessage::BlockNotification(_) => false,
             PeerMessage::BlockRequestByHeight(_) => false,
@@ -579,6 +506,7 @@ impl PeerMessage {
             PeerMessage::UnableToSatisfyBatchRequest => false,
             PeerMessage::SyncChallenge(_) => false,
             PeerMessage::SyncChallengeResponse(_) => false,
+            PeerMessage::SyncCoverage(_) => false,
         }
     }
 
@@ -607,6 +535,7 @@ impl PeerMessage {
             PeerMessage::PeerListResponse(_) => false,
             PeerMessage::Bye => false,
             PeerMessage::ConnectionStatus(_) => false,
+            PeerMessage::SyncCoverage(_) => true,
         }
     }
 }
@@ -1019,6 +948,15 @@ impl rand::distr::Distribution<NegativePeerSanction> for rand::distr::StandardUn
 
             33 => NegativePeerSanction::ReceivedSyncChallenge,
             34 => NegativePeerSanction::UnrelayableTransaction,
+
+            35 => NegativePeerSanction::OversizedAnnouncement,
+            36 => NegativePeerSanction::OversizedBlock,
+            37 => NegativePeerSanction::RequestForUnknownBlock,
+            38 => NegativePeerSanction::RequestForGenesisBlock,
+
+            39 => NegativePeerSanction::MissingLustrationAnnouncement,
+            40 => NegativePeerSanction::LustrationsWouldMakeCounterNegative,
+
             _ => unreachable!(),
         }
     }
@@ -1065,7 +1003,8 @@ impl rand::distr::Distribution<PeerStanding> for rand::distr::StandardUniform {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use macro_rules_attr::apply;
-    use rand::{random, rng};
+    use rand::random;
+    use rand::rng;
 
     use super::*;
     use crate::protocol::consensus::block::block_header::HeaderToBlockHashWitness;

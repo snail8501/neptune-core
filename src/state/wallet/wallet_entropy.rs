@@ -1,4 +1,5 @@
 use anyhow::Result;
+use num_traits::Zero;
 use serde::Deserialize;
 use serde::Serialize;
 use tasm_lib::prelude::Tip5;
@@ -11,6 +12,7 @@ use tasm_lib::twenty_first::xfe;
 use zeroize::ZeroizeOnDrop;
 
 use super::address::ReceivingAddress;
+use crate::api::export::KeyType;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::state::wallet::address::generation_address;
 use crate::state::wallet::address::symmetric_key;
@@ -28,7 +30,7 @@ pub struct WalletEntropy {
 }
 
 impl WalletEntropy {
-    pub(crate) fn new(secret_seed: SecretKeyMaterial) -> Self {
+    pub fn new(secret_seed: SecretKeyMaterial) -> Self {
         Self { secret_seed }
     }
 
@@ -45,7 +47,7 @@ impl WalletEntropy {
 
     /// Returns the spending key for guesser rewards.
     pub fn guesser_fee_key(&self) -> generation_address::GenerationSpendingKey {
-        self.nth_generation_spending_key(0u64)
+        self.composer_fee_key()
     }
 
     /// Returns the spending key for prover rewards, *i.e.*, composer fee or
@@ -58,6 +60,16 @@ impl WalletEntropy {
     /// or proof-upgrader (gobbling) fee.
     pub(crate) fn prover_fee_address(&self) -> ReceivingAddress {
         self.composer_fee_key().to_address().into()
+    }
+
+    /// Derives the nth receiving address for the given key type.
+    pub fn nth_receiving_address(&self, index: u64, key_type: KeyType) -> ReceivingAddress {
+        match key_type {
+            KeyType::Generation => {
+                ReceivingAddress::from(self.nth_generation_spending_key(index).to_address())
+            }
+            KeyType::Symmetric => ReceivingAddress::from(self.nth_symmetric_key(index)),
+        }
     }
 
     /// derives a generation spending key at `index`
@@ -144,22 +156,43 @@ impl WalletEntropy {
         seed[0..32].try_into().unwrap()
     }
 
-    /// Return the secret key that is used to deterministically generate commitment pseudo-randomness
-    /// for the mutator set.
-    pub fn generate_sender_randomness(
-        &self,
+    fn sender_randomness_inner(
+        own_secret_seed: XFieldElement,
         block_height: BlockHeight,
         receiver_digest: Digest,
     ) -> Digest {
         const SENDER_RANDOMNESS_FLAG: u64 = 0x5e116e1270u64;
+
         Tip5::hash_varlen(
             &[
-                self.secret_seed.0.encode(),
+                own_secret_seed.encode(),
                 bfe_vec![SENDER_RANDOMNESS_FLAG, block_height],
                 receiver_digest.encode(),
             ]
             .concat(),
         )
+    }
+
+    /// Return pseudo-random sender randomness derived from secret seed and
+    /// other parameters.
+    pub fn generate_sender_randomness(
+        &self,
+        block_height: BlockHeight,
+        receiver_digest: Digest,
+    ) -> Digest {
+        Self::sender_randomness_inner(self.secret_seed.0, block_height, receiver_digest)
+    }
+
+    /// Return pseudo-random sender randomness for the case where the own seed
+    /// is not desired as input.
+    ///
+    /// Used for cold-mining to derive sender randomness without relying on the
+    /// wallet's own seed.
+    pub(crate) fn sender_randomness_without_own_seed(
+        block_height: BlockHeight,
+        receiver_digest: Digest,
+    ) -> Digest {
+        Self::sender_randomness_inner(XFieldElement::zero(), block_height, receiver_digest)
     }
 
     /// Convert a secret seed phrase (list of 18 valid BIP-39 words) to a
@@ -216,5 +249,11 @@ mod tests {
             wallet_entropy.composer_fee_key().receiver_preimage().hash(),
             wallet_entropy.prover_fee_address().privacy_digest(),
         );
+    }
+
+    #[test]
+    fn devnet_phrase() {
+        let scm: SecretKeyMaterial = WalletEntropy::devnet_wallet().into();
+        println!("{}", scm.to_phrase().join("\n"));
     }
 }

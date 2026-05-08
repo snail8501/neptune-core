@@ -6,7 +6,7 @@ pub mod block_info;
 pub mod block_kernel;
 pub mod block_selector;
 pub(crate) mod block_transaction;
-mod block_validation_error;
+pub(crate) mod block_validation_error;
 pub mod difficulty_control;
 pub(crate) mod guesser_receiver_data;
 pub mod mock_block_generator;
@@ -58,19 +58,24 @@ use crate::application::loops::channel::Cancelable;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::consensus::block::block_header::BlockHeaderField;
 use crate::protocol::consensus::block::block_header::BlockPow;
+use crate::protocol::consensus::block::block_height::BLOCKS_PER_GENERATION;
 use crate::protocol::consensus::block::block_height::NUM_BLOCKS_SKIPPED_BECAUSE_REBOOT;
 use crate::protocol::consensus::block::block_kernel::BlockKernelField;
 use crate::protocol::consensus::block::block_transaction::BlockTransaction;
 use crate::protocol::consensus::block::difficulty_control::difficulty_control;
+use crate::protocol::consensus::block::difficulty_control::ProofOfWork;
 use crate::protocol::consensus::block::pow::GuesserBuffer;
+use crate::protocol::consensus::block::pow::LustrationStatus;
 use crate::protocol::consensus::block::pow::Pow;
 use crate::protocol::consensus::block::pow::PowMastPaths;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+use crate::protocol::consensus::consensus_rule_set::LustrationRule;
+use crate::protocol::consensus::transaction::transaction_kernel::TransactionLustrationError;
 use crate::protocol::consensus::transaction::utxo::Coin;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::proof_abstractions::mast_hash::HasDiscriminant;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+use crate::protocol::proof_abstractions::tasm::program::TritonProgram;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::protocol::proof_abstractions::verifier::verify;
@@ -103,9 +108,9 @@ pub(crate) const INITIAL_BLOCK_SUBSIDY: NativeCurrencyAmount = NativeCurrencyAmo
 
 /// Blocks with timestamps too far into the future are invalid. Reject blocks
 /// whose timestamp exceeds now with this value or more.
-pub(crate) const FUTUREDATING_LIMIT: Timestamp = Timestamp::minutes(5);
+pub(crate) const FUTUREDATING_LIMIT: Timestamp = Timestamp::millis(60001);
 
-/// The size of the premine.
+/// The size of the premine, 831488 coins.
 pub const PREMINE_MAX_SIZE: NativeCurrencyAmount = NativeCurrencyAmount::coins(831488);
 
 /// All blocks have proofs except the genesis block
@@ -249,15 +254,15 @@ impl Block {
     }
 
     async fn make_block_template_with_valid_proof(
-        predecessor: &Block,
+        predecessor: Block,
         transaction: BlockTransaction,
         block_timestamp: Timestamp,
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
         proof_job_options: TritonVmProofJobOptions,
     ) -> anyhow::Result<Block> {
-        let next_block_height = predecessor.header().height.next();
+        let new_height = predecessor.header().height.next();
         let network = proof_job_options.job_settings.network;
-        let consensus_rule_set = ConsensusRuleSet::infer_from(network, next_block_height);
+        let consensus_rule_set = ConsensusRuleSet::infer_from(network, new_height);
         let tx_claim = BlockAppendix::transaction_validity_claim(
             transaction.kernel.mast_hash(),
             consensus_rule_set,
@@ -276,8 +281,7 @@ impl Block {
             transaction.kernel.merge_bit,
             "Merge-bit must be set in transactions before they can be included in blocks."
         );
-        let primitive_witness =
-            BlockPrimitiveWitness::new(predecessor.to_owned(), transaction, network);
+        let primitive_witness = BlockPrimitiveWitness::new(predecessor, transaction, network);
         Self::block_template_from_block_primitive_witness(
             primitive_witness,
             block_timestamp,
@@ -291,7 +295,7 @@ impl Block {
     ///
     /// Create a block with valid block proof, but without proof-of-work.
     pub(crate) async fn compose(
-        predecessor: &Block,
+        predecessor: Block,
         transaction: BlockTransaction,
         block_timestamp: Timestamp,
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
@@ -334,20 +338,43 @@ impl Block {
         self.unset_digest();
     }
 
-    /// sets header timestamp and difficulty.
+    /// Set the lustration status found in the block's header.
     ///
-    /// These must be set as a pair because the difficulty depends
-    /// on the timestamp, and may change with it.
+    /// Note: this causes the block digest to change.
+    pub fn set_lustration_status(&mut self, lustration_status: LustrationStatus) {
+        self.kernel
+            .header
+            .pow
+            .set_lustration_status(lustration_status);
+        self.unset_digest();
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_unparseable_lustration_status(&mut self) {
+        self.kernel.header.pow.set_unparseable_lustration_status();
+        self.unset_digest();
+    }
+
+    /// sets header timestamp, difficulty and, optionally, cumulative proof of
+    /// work.
+    ///
+    /// These must be set as a pair or triplet because the difficulty depends
+    /// on the timestamp, and may change with it. Depending on the consensus
+    /// rules, the cumulative proof of work must also be updated.
     ///
     /// note: this causes block digest to change.
     #[inline]
-    pub(crate) fn set_header_timestamp_and_difficulty(
+    pub(crate) fn set_difficulty_related_fields(
         &mut self,
         timestamp: Timestamp,
         difficulty: Difficulty,
+        cumulative_proof_of_work: Option<ProofOfWork>,
     ) {
         self.kernel.header.timestamp = timestamp;
         self.kernel.header.difficulty = difficulty;
+        if let Some(cumulative_proof_of_work) = cumulative_proof_of_work {
+            self.kernel.header.cumulative_proof_of_work = cumulative_proof_of_work;
+        }
 
         self.unset_digest();
     }
@@ -378,7 +405,7 @@ impl Block {
     }
 
     #[inline]
-    pub(crate) fn appendix(&self) -> &BlockAppendix {
+    pub fn appendix(&self) -> &BlockAppendix {
         &self.kernel.appendix
     }
 
@@ -479,7 +506,7 @@ impl Block {
     /// percolates into the mutator set hash and eventually into all transaction
     /// kernels. The net result is that broadcasting transaction on other
     /// networks invalidates the lock script proofs.
-    pub(crate) fn premine_sender_randomness(network: Network) -> Digest {
+    pub fn premine_sender_randomness(network: Network) -> Digest {
         Digest::new(bfe_array![u64::from(network.id()), 0, 0, 0, 0])
     }
 
@@ -721,10 +748,11 @@ impl Block {
         // Note that there is a correspondence between the logic here and the
         // error types in `BlockValidationError`.
 
-        let consensus_rule_set = ConsensusRuleSet::infer_from(network, self.header().height);
+        let new_height = self.header().height;
+        let consensus_rule_set = ConsensusRuleSet::infer_from(network, new_height);
 
         // 0.a)
-        if previous_block.kernel.header.height.next() != self.kernel.header.height {
+        if previous_block.kernel.header.height.next() != new_height {
             return Err(BlockValidationError::BlockHeight);
         }
 
@@ -764,13 +792,19 @@ impl Block {
             )
         };
 
-        if self.kernel.header.difficulty != expected_difficulty {
+        let new_difficulty = self.kernel.header.difficulty;
+        if new_difficulty != expected_difficulty {
             return Err(BlockValidationError::Difficulty);
         }
 
         // 0.f)
+        let delta_difficulty = if consensus_rule_set.use_parent_difficulty() {
+            previous_block.header().difficulty
+        } else {
+            new_difficulty
+        };
         let expected_cumulative_proof_of_work =
-            previous_block.header().cumulative_proof_of_work + previous_block.header().difficulty;
+            previous_block.header().cumulative_proof_of_work + delta_difficulty;
         if self.header().cumulative_proof_of_work != expected_cumulative_proof_of_work {
             return Err(BlockValidationError::CumulativeProofOfWork);
         }
@@ -781,31 +815,19 @@ impl Block {
             return Err(BlockValidationError::FutureDating);
         }
 
-        // 1.a)
-        for required_claim in BlockAppendix::consensus_claims(self.body(), consensus_rule_set) {
-            if !self.appendix().contains(&required_claim) {
-                return Err(BlockValidationError::AppendixMissingClaim);
-            }
-        }
-
-        // 1.b)
-        if self.appendix().len() > MAX_NUM_CLAIMS {
-            return Err(BlockValidationError::AppendixTooLarge);
-        }
-
-        // 1.c)
-        let BlockProof::SingleProof(block_proof) = &self.proof else {
-            return Err(BlockValidationError::ProofQuality);
-        };
-
-        // 1.d)
-        if !BlockProgram::verify(self.body(), self.appendix(), block_proof, network).await {
-            return Err(BlockValidationError::ProofValidity);
-        }
+        // 1.a, 1.b, 1.c, 1.d
+        self.validate_block_proof(network).await?;
 
         // 1.e)
         if self.size() > consensus_rule_set.max_block_size() {
             return Err(BlockValidationError::MaxSize);
+        }
+
+        // 1.f)
+        if consensus_rule_set.requires_version_in_pow()
+            && self.header().version != self.header().pow.version_in_pow()
+        {
+            return Err(BlockValidationError::VersionMismatch);
         }
 
         // 2.a)
@@ -818,6 +840,11 @@ impl Block {
             if !msa_before.can_remove(removal_record) {
                 return Err(BlockValidationError::RemovalRecordsValidity);
             }
+        }
+
+        // 2.t)
+        if msa_before.hash() != self.body().transaction_kernel.mutator_set_hash {
+            return Err(BlockValidationError::TransactionMutatorSetMismatch);
         }
 
         // 2.c)
@@ -890,6 +917,133 @@ impl Block {
             return Err(BlockValidationError::TooManyAnnouncements);
         }
 
+        let first_lustration_block = ConsensusRuleSet::first_lustration_block(network);
+        if new_height >= first_lustration_block {
+            let last_aocl_leaf_index = self.body().max_aocl_leaf_index();
+            let transparency_rule =
+                ConsensusRuleSet::lustration_rule(network, new_height, last_aocl_leaf_index)
+                    .expect("Must have transparency rule if height exceeds first such block");
+
+            // 2.m)
+            let Ok(read) = self.header().pow.lustration_status() else {
+                return Err(BlockValidationError::BadLustrationCounterEncoding);
+            };
+
+            match transparency_rule {
+                LustrationRule::Initial(expected) => {
+                    // 2.p
+                    if read.counter != expected.counter {
+                        return Err(BlockValidationError::BadLustrationCounter {
+                            got: read.counter,
+                            expected: expected.counter,
+                        });
+                    }
+
+                    // 2.q
+                    if read.max_lustrating_aocl_leaf_index
+                        != expected.max_lustrating_aocl_leaf_index
+                    {
+                        return Err(BlockValidationError::BadLustrationAoclThreshold {
+                            got: read.max_lustrating_aocl_leaf_index,
+                            expected: expected.max_lustrating_aocl_leaf_index,
+                        });
+                    }
+                }
+                LustrationRule::Updated { initial_counter } => {
+                    // 2.n)
+                    let Ok(parent) = previous_block.header().pow.lustration_status() else {
+                        return Err(BlockValidationError::BadLustrationCounterEncodingOfParent);
+                    };
+
+                    // 2.q
+                    if read.max_lustrating_aocl_leaf_index != parent.max_lustrating_aocl_leaf_index
+                    {
+                        return Err(BlockValidationError::BadLustrationAoclThreshold {
+                            got: read.max_lustrating_aocl_leaf_index,
+                            expected: parent.max_lustrating_aocl_leaf_index,
+                        });
+                    }
+
+                    let aocl_threshold = parent.max_lustrating_aocl_leaf_index;
+                    let lustration_result = self
+                        .body()
+                        .transaction_kernel
+                        .verified_lustration_amount(aocl_threshold);
+                    let verified_lustrated_amt = match lustration_result {
+                        Ok(amount) => amount,
+                        // 2.o
+                        Err(TransactionLustrationError::MissingLustrationAnnouncement) => {
+                            return Err(BlockValidationError::MissingLustrationAnnouncement);
+                        }
+                        // xxx
+                        Err(_) => return Err(BlockValidationError::UnknownLustrationProblem),
+                    };
+
+                    // 2.r
+                    let Some(expected_counter) =
+                        parent.counter.checked_sub(&verified_lustrated_amt)
+                    else {
+                        return Err(BlockValidationError::NegativeLustrationCounter {
+                            got: -verified_lustrated_amt
+                                .checked_sub(&parent.counter)
+                                .expect("subtracting smaller amount from bigger amount"),
+                        });
+                    };
+
+                    // I don't think this error *can* be hit without the next
+                    // error also being hit. But security-in-depth!
+                    // 2.s
+                    if read.counter > initial_counter {
+                        return Err(BlockValidationError::LustrationCounterExceedsInitialValue {
+                            got: read.counter,
+                            initial: initial_counter,
+                        });
+                    }
+
+                    // 2.p
+                    if expected_counter != read.counter {
+                        return Err(BlockValidationError::BadLustrationCounter {
+                            got: read.counter,
+                            expected: expected_counter,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate the proof of a block, an that the proof relates to the expected
+    /// appendices.
+    pub(crate) async fn validate_block_proof(
+        &self,
+        network: Network,
+    ) -> Result<(), BlockValidationError> {
+        let consensus_rule_set = ConsensusRuleSet::infer_from(network, self.header().height);
+
+        // 1.a)
+        for required_claim in BlockAppendix::consensus_claims(self.body(), consensus_rule_set) {
+            if !self.appendix().contains(&required_claim) {
+                return Err(BlockValidationError::AppendixMissingClaim);
+            }
+        }
+
+        // 1.b)
+        if self.appendix().len() > MAX_NUM_CLAIMS {
+            return Err(BlockValidationError::AppendixTooLarge);
+        }
+
+        // 1.c)
+        let BlockProof::SingleProof(block_proof) = &self.proof else {
+            return Err(BlockValidationError::ProofQuality);
+        };
+
+        // 1.d)
+        if !BlockProgram::verify(self.body(), self.appendix(), block_proof, network).await {
+            return Err(BlockValidationError::ProofValidity);
+        }
+
         Ok(())
     }
 
@@ -915,8 +1069,9 @@ impl Block {
     /// Determine whether the proof-of-work puzzle was solved correctly.
     ///
     /// Specifically, compare the hash of the current block against the
-    /// target corresponding to the previous block's difficulty and return true
-    /// if the former is smaller.
+    /// required target. Depending on the consensus rule set that applies, this
+    /// may be either the parent block's difficulty, or the block's own
+    /// difficulty. Returns true if the target is met.
     pub fn has_proof_of_work(&self, network: Network, previous_block_header: &BlockHeader) -> bool {
         // enforce network difficulty-reset-interval if present. Note that *no*
         // pow checks are enforced in this case, not even Merkle authentication
@@ -931,14 +1086,13 @@ impl Block {
             return true;
         }
 
-        let threshold = previous_block_header.difficulty.target();
-        if network.allows_mock_pow() && self.is_valid_mock_pow(threshold) {
+        let parent_threshold = previous_block_header.difficulty.target();
+        if network.allows_mock_pow() && self.is_valid_mock_pow(parent_threshold) {
             return true;
         }
 
-        let consensus_rule_set =
-            ConsensusRuleSet::infer_from(network, previous_block_header.height.next());
-        self.pow_verify(threshold, consensus_rule_set)
+        let consensus_rule_set = ConsensusRuleSet::infer_from(network, self.header().height);
+        self.pow_verify(parent_threshold, consensus_rule_set)
     }
 
     /// Produce the MAST authentication paths for the `pow` field on
@@ -998,19 +1152,47 @@ impl Block {
     /// Satisfy mock-PoW, meaning that only the hash needs to be lower than the
     /// threshold, does not set valid root/authentication paths of the PoW
     /// field.
-    pub fn satisfy_mock_pow(&mut self, difficulty: Difficulty, seed: [u8; 32]) {
+    pub fn satisfy_mock_pow(
+        &mut self,
+        difficulty: Difficulty,
+        seed: [u8; 32],
+        lustration_status: Option<LustrationStatus>,
+        version: BFieldElement,
+    ) {
         let mut rng = StdRng::from_seed(seed);
 
         // Guessing loop.
         let threshold = difficulty.target();
         while !self.is_valid_mock_pow(threshold) {
-            let pow = rng.random();
+            let mut pow: BlockPow = rng.random();
+            if let Some(lustration_status) = lustration_status {
+                pow.set_lustration_status(lustration_status);
+            }
+
+            pow.set_version_in_pow(version);
+
             self.set_header_pow(pow);
         }
     }
 
-    /// Verify that block digest is less than threshold and integral.
-    pub fn pow_verify(&self, target: Digest, consensus_rule_set: ConsensusRuleSet) -> bool {
+    /// Verify that block digest is less than the required threshold, and follow
+    /// any other proof-of-work rules defined by the consensus rule set.
+    ///
+    /// Parent target is only used if the consensus rules dicate that.
+    /// Otherwise, the block's own difficulty is used.
+    ///
+    /// Internal function. For checking if a block has sufficient proof of work,
+    /// you should use [`Self::has_proof_of_work`] instead since that function
+    /// automatically uses the correct consensus rule set.
+    ///
+    /// Exposed for external validators (e.g. FFI) that supply an explicit
+    /// parent difficulty digest instead of a full parent header.
+    pub fn pow_verify(&self, parent_target: Digest, consensus_rule_set: ConsensusRuleSet) -> bool {
+        let target = if consensus_rule_set.use_parent_difficulty() {
+            parent_target
+        } else {
+            self.header().difficulty.target()
+        };
         let auth_paths = self.pow_mast_paths();
         self.header()
             .pow
@@ -1103,22 +1285,147 @@ impl Block {
         self.kernel.guesser_fee_addition_records(block_hash)
     }
 
+    /// Return all addition records (transaction outputs) in this block,
+    /// including guesser rewards.
+    pub(crate) fn all_addition_records(&self) -> Result<Vec<AdditionRecord>, BlockValidationError> {
+        let block_hash = self.hash();
+        self.kernel.all_addition_records(block_hash)
+    }
+
     /// Return the mutator set update corresponding to this block, which sends
     /// the mutator set accumulator after the predecessor to the mutator set
     /// accumulator after self.
     pub(crate) fn mutator_set_update(&self) -> Result<MutatorSetUpdate, BlockValidationError> {
-        let inputs = RemovalRecordList::try_unpack(self.body().transaction_kernel.inputs.clone())
-            .map_err(BlockValidationError::from)?;
+        let block_hash = self.hash();
+        self.kernel.mutator_set_update(block_hash)
+    }
 
-        let mut mutator_set_update =
-            MutatorSetUpdate::new(inputs, self.body().transaction_kernel.outputs.clone());
+    /// Compute the total supply of coins that were liquid immediately after
+    /// being mined.
+    pub(crate) fn mined_immediately_liquid_supply(
+        current_height: BlockHeight,
+    ) -> NativeCurrencyAmount {
+        Self::mined_supply(current_height).half()
+    }
 
-        let guesser_addition_records = self.guesser_fee_addition_records()?;
-        mutator_set_update
-            .additions
-            .extend(guesser_addition_records);
+    /// Compute the total supply of coins that were time-locked after mining and
+    /// are now (heuristically) released.
+    ///
+    /// The heuristic is to pretend that the blocks came in spaced apart by
+    /// exactly the target block interval. This model allows us to consider as
+    /// as expired the time-locks on subsidies for blocks more than one full
+    /// generation (`BLOCKS_PER_GENERATION`) ago, and all other time-locks still
+    /// in effect. In practice, the time-locks are released at a timestamp (not
+    /// a block height) and that timestamp does not need  to coincide with
+    /// exactly one full generation since the block was mined.
+    pub(crate) fn mined_timelocked_and_released_supply(
+        current_height: BlockHeight,
+    ) -> NativeCurrencyAmount {
+        let one_generation_ago =
+            BlockHeight::from(current_height.value().saturating_sub(BLOCKS_PER_GENERATION));
+        Self::mined_supply(one_generation_ago).half()
+    }
 
-        Ok(mutator_set_update)
+    /// Compute the total mined money supply at a given block height, measured
+    /// in number of Neptune coins.
+    ///
+    /// The number does not count
+    ///  - the original premine,
+    ///  - the claims fund or claims, and
+    ///  - burns.
+    ///
+    /// It *does* count time-locked coins.
+    ///
+    /// This number is computed via arithmetic and geometric sums, implicitly
+    /// assuming that the miners rationally mint the maximum allowable coinbase.
+    pub(crate) fn mined_supply(current_height: BlockHeight) -> NativeCurrencyAmount {
+        // The first generation is special because of the genesis block and
+        // because of the skipped blocks due to reboot.
+        let num_blocks_in_generation_zero =
+            BLOCKS_PER_GENERATION - NUM_BLOCKS_SKIPPED_BECAUSE_REBOOT;
+        if num_blocks_in_generation_zero > current_height.into() {
+            // Number of blocks mined in this generation is equal to current
+            // block height because the genesis block (height 0) is not mined.
+            let num_mined_blocks = u64::from(current_height);
+            return INITIAL_BLOCK_SUBSIDY.scalar_mul(num_mined_blocks.try_into().unwrap());
+        }
+
+        // Nothing is mined in genesis block. All other blocks in generation
+        // zero did mine.
+        let num_coins_mined_in_generation_zero = INITIAL_BLOCK_SUBSIDY
+            .scalar_mul(u32::try_from(num_blocks_in_generation_zero).unwrap() - 1);
+        let mut total = num_coins_mined_in_generation_zero;
+
+        // Account for the blocks skipped because of the reboot. Do this by
+        // offsetting the current high so that we get clean wrap arounds modulo
+        // the number of blocks per generation.
+        let effective_block_height: u64 = u64::from(current_height) - num_blocks_in_generation_zero;
+        let current_generation = 1 + effective_block_height / BLOCKS_PER_GENERATION;
+        let current_block_in_generation = (effective_block_height) % BLOCKS_PER_GENERATION;
+
+        // Generation 40 is the first generation where precision is lost in the
+        // block subsidy. From that generation onwards, the geometric sum is not
+        // exact. So we use the geometric sum up until generation 39 and switch
+        // to an iterative rectangular formula after that.
+        let max_generation = 39;
+
+        // In the following we need the geometric sum. The formula is
+        // re-derived for your convenience here.
+        // L = sum from { i = 1 } to { C-1 } of { I * B / 2^i }
+        // L / 2 = B * sum from { i = 1 } to { C-1 } of { I / 2^(i+1) }
+        // L / 2 = B * sum from { i = 2 } to { C } of { I / 2^i }
+        // L - L / 2 = B * ( I/2 - I/2^C ) = L / 2 .
+        // So L = 2 * B * (I/2 - I/2^C) .
+
+        // Compute the total mined coins from all complete generations, except
+        // 0, and up to 40, using the geometric sum with
+        //  - I = INITIAL_BLOCK_SUBSIDY
+        //  - B = BLOCKS_PER_GENERATION
+        //  - C = current_generation.
+        let mut final_block_subsidy = NativeCurrencyAmount::from_nau(
+            INITIAL_BLOCK_SUBSIDY.to_nau() >> u64::min(max_generation, current_generation),
+        );
+        total += (INITIAL_BLOCK_SUBSIDY
+            .half()
+            .checked_sub(&final_block_subsidy)
+            .unwrap())
+        .scalar_mul(2 * u32::try_from(BLOCKS_PER_GENERATION).unwrap());
+
+        // If we are in a generation beyond the point where precision is lost,
+        // iterate over all generations between 40 and now and compute a
+        // contribution per generation.
+        if current_generation > max_generation {
+            for _ in max_generation..current_generation {
+                total +=
+                    final_block_subsidy.scalar_mul(u32::try_from(BLOCKS_PER_GENERATION).unwrap());
+                final_block_subsidy = final_block_subsidy.half();
+            }
+        }
+
+        // Count the liquid mined coins in the current (incomplete) generation
+        // using the rectangular formula.
+        total +=
+            final_block_subsidy.scalar_mul(u32::try_from(current_block_in_generation).unwrap() + 1);
+
+        total
+    }
+}
+
+#[cfg(test)]
+impl rand::distr::Distribution<Block> for rand::distr::StandardUniform {
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Block {
+        use crate::api::export::NeptuneProof;
+
+        let kernel = rng.random::<BlockKernel>();
+        let proof = BlockProof::SingleProof(NeptuneProof::from(
+            (0..10).map(|_| rng.random()).collect_vec(),
+        ));
+        let digest = OnceLock::new();
+        Block {
+            kernel,
+            proof,
+            digest,
+        }
     }
 }
 
@@ -1150,7 +1457,7 @@ pub(crate) mod tests {
     use crate::application::loops::mine_loop::coinbase_distribution::CoinbaseDistribution;
     use crate::application::loops::mine_loop::composer_parameters::ComposerParameters;
     use crate::application::loops::mine_loop::prepare_coinbase_transaction_stateless;
-    use crate::application::loops::mine_loop::tests::make_coinbase_transaction_from_state;
+    use crate::application::loops::mine_loop::tests::make_coinbase_transaction_from_state_lock;
     use crate::application::rpc::server::proof_of_work_puzzle::ProofOfWorkPuzzle;
     use crate::application::triton_vm_job_queue::vm_job_queue;
     use crate::application::triton_vm_job_queue::TritonVmJobPriority;
@@ -1173,12 +1480,46 @@ pub(crate) mod tests {
     use crate::tests::shared::mock_tx::make_mock_transaction;
     use crate::tests::shared_tokio_runtime;
     use crate::util_types::archival_mmr::ArchivalMmr;
+    use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
 
     pub(crate) const DIFFICULTY_LIMIT_FOR_TESTS: u32 = 20_000;
 
     impl Block {
+        /// Return all absolute index sets (transaction inputs) in this block.
+        pub(crate) fn all_absolute_index_sets(&self) -> Vec<AbsoluteIndexSet> {
+            self.body()
+                .transaction_kernel
+                .inputs
+                .iter()
+                .map(|x| x.absolute_indices)
+                .collect()
+        }
+
         pub(crate) fn set_proof(&mut self, proof: BlockProof) {
             self.proof = proof;
+            self.unset_digest();
+        }
+
+        pub(super) fn fix_mutator_set_fields(&mut self, prev_block: &Block) {
+            let mut msa = prev_block.mutator_set_accumulator_after().unwrap();
+
+            let new_kernel = TransactionKernelModifier::default()
+                .mutator_set_hash(msa.hash())
+                .modify(self.kernel.body.transaction_kernel.clone());
+            self.kernel.body.transaction_kernel = new_kernel;
+
+            let ms_update = MutatorSetUpdate::new(
+                self.body().transaction_kernel.inputs.clone(),
+                self.body().transaction_kernel.outputs.clone(),
+            );
+
+            ms_update.apply_to_accumulator(&mut msa).unwrap();
+            self.kernel.body.mutator_set_accumulator = msa;
+            self.unset_digest();
+        }
+
+        pub(crate) fn set_appendix(&mut self, appendix: BlockAppendix) {
+            self.kernel.appendix = appendix;
             self.unset_digest();
         }
 
@@ -1245,16 +1586,58 @@ pub(crate) mod tests {
             parent_difficulty: Difficulty,
             consensus_rule_set: ConsensusRuleSet,
         ) {
-            println!("Trying to guess for difficulty: {parent_difficulty}");
+            let difficulty = if consensus_rule_set.use_parent_difficulty() {
+                parent_difficulty
+            } else {
+                self.header().difficulty
+            };
+
+            println!("Trying to guess for difficulty: {difficulty}");
             assert!(
-                parent_difficulty < Difficulty::from(DIFFICULTY_LIMIT_FOR_TESTS),
+                difficulty < Difficulty::from(DIFFICULTY_LIMIT_FOR_TESTS),
                 "Don't use high difficulty in test"
             );
 
-            let puzzle = ProofOfWorkPuzzle::new(self.clone(), parent_difficulty);
+            let puzzle = ProofOfWorkPuzzle::new(self.clone(), difficulty);
             let valid_pow = puzzle.solve(consensus_rule_set);
 
             self.set_header_pow(valid_pow);
+        }
+
+        /// Check if PoW requirement has been fulfilled, allowing for the
+        /// overriding of the consensus rule set.
+        pub(crate) fn pow_verify_for_tests(
+            &self,
+            parent_target: Digest,
+            consensus_rule_set: ConsensusRuleSet,
+        ) -> bool {
+            self.pow_verify(parent_target, consensus_rule_set)
+        }
+
+        #[inline]
+        pub(crate) fn set_header_height(&mut self, block_height: BlockHeight) {
+            self.kernel.header.height = block_height;
+
+            self.unset_digest();
+        }
+
+        pub(crate) fn set_header_version_in_pow_only(&mut self, value: BFieldElement) {
+            self.kernel.header.pow.set_version_in_pow(value);
+
+            self.unset_digest();
+        }
+
+        pub(crate) fn set_version_in_header_only(&mut self, value: BFieldElement) {
+            self.kernel.header.version = value;
+
+            self.unset_digest();
+        }
+
+        pub(crate) fn set_version_consistently(&mut self, value: BFieldElement) {
+            self.kernel.header.version = value;
+            self.kernel.header.pow.set_version_in_pow(value);
+
+            self.unset_digest();
         }
     }
 
@@ -1267,13 +1650,21 @@ pub(crate) mod tests {
             block_mmr_accumulator in arb::<MmrAccumulator>(),
             appendix in arb::<BlockAppendix>(),
             mutator_set_accumulator in arb::<MutatorSetAccumulator>(),
-        ) -> Block {Block{
-            kernel: BlockKernel{ header, body: BlockBody::new(
-                transaction_kernel, mutator_set_accumulator, lock_free_mmr_accumulator, block_mmr_accumulator
-            ), appendix },
-            proof: Default::default(),
-            digest: Default::default()
-        }}
+        ) -> Block {
+            Block {
+                kernel: BlockKernel {
+                    header, body: BlockBody::new(
+                        transaction_kernel,
+                        mutator_set_accumulator,
+                        lock_free_mmr_accumulator,
+                        block_mmr_accumulator
+                    ),
+                    appendix
+                },
+                proof: Default::default(),
+                digest: Default::default(),
+            }
+        }
     }
 
     #[test]
@@ -1305,14 +1696,21 @@ pub(crate) mod tests {
     fn guess_nonce_happy_path() {
         let network = Network::Main;
         let genesis = Block::genesis(network);
-        let mut invalid_block = invalid_empty_block(&genesis, network);
-        let mast_auth_paths = invalid_block.pow_mast_paths();
+        let parent_target = genesis.header().difficulty.target();
 
         for consensus_rule_set in ConsensusRuleSet::iter() {
+            let mut invalid_block = invalid_empty_block(&genesis, network);
+            let mast_auth_paths = invalid_block.pow_mast_paths();
             let guesser_buffer = invalid_block.guess_preprocess(None, None, consensus_rule_set);
-            let target = Difficulty::from(2u32).target();
+            let target = if consensus_rule_set.use_parent_difficulty() {
+                parent_target
+            } else {
+                invalid_block.header().difficulty.target()
+            };
             let mut rng = rng();
             let index_picker_preimage = guesser_buffer.index_picker_preimage(&mast_auth_paths);
+
+            let version = invalid_block.header().version;
 
             let valid_pow = loop {
                 if let Some(valid_pow) = Pow::guess(
@@ -1321,17 +1719,22 @@ pub(crate) mod tests {
                     index_picker_preimage,
                     rng.random(),
                     target,
+                    None,
+                    Some(version),
                 ) {
                     break valid_pow;
                 }
             };
 
             assert!(
-                !invalid_block.pow_verify(target, consensus_rule_set),
+                !invalid_block.pow_verify(parent_target, consensus_rule_set),
                 "Pow verification must fail prior to setting PoW"
             );
             invalid_block.set_header_pow(valid_pow);
-            assert!(invalid_block.pow_verify(target, consensus_rule_set));
+            assert!(
+                invalid_block.pow_verify(parent_target, consensus_rule_set,),
+                "pow for {consensus_rule_set} rules must be satisfied after correct guess"
+            );
         }
     }
 
@@ -1693,9 +2096,11 @@ pub(crate) mod tests {
 
         use super::*;
         use crate::application::loops::mine_loop::create_block_transaction_from;
-        use crate::application::loops::mine_loop::tests::make_coinbase_transaction_from_state;
+        use crate::application::loops::mine_loop::tests::make_coinbase_transaction_from_state_lock;
         use crate::application::loops::mine_loop::TxMergeOrigin;
         use crate::application::triton_vm_job_queue::vm_job_queue;
+        use crate::protocol::proof_abstractions::verifier::disable_true_claims_cache;
+        use crate::protocol::proof_abstractions::verifier::enable_true_claims_cache;
         use crate::state::transaction::tx_creation_config::TxCreationConfig;
         use crate::state::wallet::address::KeyType;
         use crate::tests::shared::blocks::fake_valid_successor_for_tests;
@@ -1730,7 +2135,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
             let block1_proposal = Block::compose(
-                &genesis,
+                genesis.clone(),
                 transaction,
                 plus_one_hour,
                 vm_job_queue(),
@@ -1745,7 +2150,7 @@ pub(crate) mod tests {
         #[apply(shared_tokio_runtime)]
         async fn block_with_valid_proof_passes() {
             let (predecesor, time, network, block) = deterministic_empty_block1_proposal().await;
-            assert!(block.validate(&predecesor, time, network).await.is_ok());
+            assert!(block.validate(&predecesor, time, network,).await.is_ok());
         }
 
         #[traced_test]
@@ -1764,13 +2169,23 @@ pub(crate) mod tests {
             let index = rng.random_range(0..proof_length);
             block_proof.0.get_mut(index).unwrap().increment();
 
+            // Since the block is deterministic, it may have been validated
+            // already. In a test environment, its verified-to-be-true claim
+            // would have been absorbed into the true claims cache. In this
+            // case, even the false proof will validate. So in order to make the
+            // test meaningful, we first have to clear or disable the true
+            // claims cache.
+            disable_true_claims_cache().await;
+
             assert_eq!(
                 BlockValidationError::ProofValidity,
                 block
-                    .validate(&predecesor, time, network)
+                    .validate(&predecesor, time, network,)
                     .await
                     .unwrap_err()
             );
+
+            enable_true_claims_cache().await;
         }
 
         #[traced_test]
@@ -1784,7 +2199,7 @@ pub(crate) mod tests {
             assert_eq!(
                 BlockValidationError::ProofValidity,
                 block
-                    .validate(&predecesor, time, network)
+                    .validate(&predecesor, time, network,)
                     .await
                     .unwrap_err()
             );
@@ -1839,7 +2254,7 @@ pub(crate) mod tests {
             );
 
             let plus_eight_months = plus_seven_months + Timestamp::months(1);
-            let (coinbase_for_block2, _) = make_coinbase_transaction_from_state(
+            let (coinbase_for_block2, _) = make_coinbase_transaction_from_state_lock(
                 &block1,
                 &alice,
                 plus_eight_months,
@@ -1888,7 +2303,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
                 let block2_without_valid_pow = Block::compose(
-                    &block1,
+                    block1.clone(),
                     block2_tx,
                     plus_eight_months,
                     TritonVmJobQueue::get_instance(),
@@ -1908,7 +2323,7 @@ pub(crate) mod tests {
                     .set_new_tip(block2_without_valid_pow.clone())
                     .await
                     .unwrap();
-                let (coinbase_for_block3, _) = make_coinbase_transaction_from_state(
+                let (coinbase_for_block3, _) = make_coinbase_transaction_from_state_lock(
                     &block2_without_valid_pow,
                     &alice,
                     plus_nine_months,
@@ -1950,7 +2365,7 @@ pub(crate) mod tests {
                     "block transaction 3 must have inputs"
                 );
                 let block3_without_valid_pow = Block::compose(
-                    &block2_without_valid_pow,
+                    block2_without_valid_pow.clone(),
                     block3_tx,
                     plus_nine_months,
                     TritonVmJobQueue::get_instance(),
@@ -1979,25 +2394,25 @@ pub(crate) mod tests {
             let mut block1 =
                 fake_valid_successor_for_tests(&genesis_block, now, rng.random(), network).await;
 
-            // Set block timestamp 4 minutes in the future.  (is valid)
-            let future_time1 = now + Timestamp::minutes(4);
+            // Set block timestamp 30 seconds in the future.  (is valid)
+            let future_time1 = now + Timestamp::seconds(30);
             block1.kernel.header.timestamp = future_time1;
             assert!(block1.is_valid(&genesis_block, now, network).await);
 
             now = block1.kernel.header.timestamp;
 
-            // Set block timestamp 5 minutes - 1 sec in the future.  (is valid)
-            let future_time2 = now + Timestamp::minutes(5) - Timestamp::seconds(1);
+            // Set block timestamp 1 minute in the future.  (is valid)
+            let future_time2 = now + Timestamp::minutes(1);
             block1.kernel.header.timestamp = future_time2;
             assert!(block1.is_valid(&genesis_block, now, network).await);
 
-            // Set block timestamp 5 minutes in the future. (not valid)
-            let future_time3 = now + Timestamp::minutes(5);
+            // Set block timestamp 1 minute + 1ms in the future. (not valid)
+            let future_time3 = now + Timestamp::minutes(1) + Timestamp::millis(1);
             block1.kernel.header.timestamp = future_time3;
             assert!(!block1.is_valid(&genesis_block, now, network).await);
 
-            // Set block timestamp 5 minutes + 1 sec in the future. (not valid)
-            let future_time4 = now + Timestamp::minutes(5) + Timestamp::seconds(1);
+            // Set block timestamp 1 minute + 1 sec in the future. (not valid)
+            let future_time4 = now + Timestamp::minutes(1) + Timestamp::seconds(1);
             block1.kernel.header.timestamp = future_time4;
             assert!(!block1.is_valid(&genesis_block, now, network).await);
 
@@ -2348,7 +2763,7 @@ pub(crate) mod tests {
             now += network.target_block_interval();
 
             // create coinbase transaction
-            let (transaction, _) = make_coinbase_transaction_from_state(
+            let (transaction, _) = make_coinbase_transaction_from_state_lock(
                 &blocks[i - 1],
                 &alice,
                 launch_date,
@@ -2425,7 +2840,7 @@ pub(crate) mod tests {
 
             // compose block
             let block = Block::compose(
-                blocks.last().unwrap(),
+                blocks.last().unwrap().to_owned(),
                 transaction.try_into().expect(
                     "went through at least one iteration of above loop, so merge bit must be set",
                 ),
@@ -2445,6 +2860,90 @@ pub(crate) mod tests {
             alice.set_new_tip(block.clone()).await.unwrap();
 
             blocks.push(block);
+        }
+    }
+
+    mod currency_supply {
+        use proptest::prop_assert_eq;
+        use test_strategy::proptest;
+
+        use super::*;
+
+        /// Compute the liquid mined money supply at a given block height,
+        /// measured in number of Neptune coins. This is a slow, but explicit,
+        /// algorithm for computing (hopefully) the same result as
+        /// [`Block::mined_supply`]. That's "hopefully" because this
+        /// method is what that faster one is being tested against.
+        pub(crate) fn mined_supply_slow(current_height: BlockHeight) -> NativeCurrencyAmount {
+            // Nothing is mined in genesis block.
+            let mut total = NativeCurrencyAmount::coins(0);
+
+            // For all blocks until and including now (but skipping the genesis)
+            // block, add the block subsidy.
+            let mut last_generation = BlockHeight::genesis().get_generation();
+            for height in 1_u64..=current_height.into() {
+                if BlockHeight::from(height).get_generation() != last_generation {
+                    last_generation = BlockHeight::from(height).get_generation();
+                }
+                total += Block::block_subsidy(height.into());
+            }
+
+            total
+        }
+
+        #[proptest(cases = 4)]
+        fn fast_and_slow_methods_for_supply_agree_prop(
+            #[strategy(0u64..=20584320)] current_block_height: u64,
+        ) {
+            prop_assert_eq!(
+                Block::mined_supply(current_block_height.into()).to_nau(),
+                mined_supply_slow(current_block_height.into()).to_nau()
+            );
+        }
+
+        #[test]
+        fn fast_and_slow_methods_for_supply_agree_unit() {
+            for current_block_height in [
+                1395, 13950, 80827, 139505, 6057182, 7957182, 209766, 220232, 300320, 20584320,
+            ] {
+                println!("testing current block height {current_block_height} ...");
+                assert_eq!(
+                    Block::mined_supply(current_block_height.into()).to_nau(),
+                    mined_supply_slow(current_block_height.into()).to_nau()
+                );
+            }
+        }
+
+        #[test]
+        fn mined_supply_has_sane_limit() {
+            let claims_pool = INITIAL_BLOCK_SUBSIDY
+                .scalar_mul(u32::try_from(NUM_BLOCKS_SKIPPED_BECAUSE_REBOOT).unwrap());
+            let premine_max_size = PREMINE_MAX_SIZE;
+
+            let very_far_future = BLOCKS_PER_GENERATION * 128;
+            // let total_mined = Block::mined_supply(very_far_future.into());
+            let total_mined = mined_supply_slow(very_far_future.into());
+
+            assert!(
+                (total_mined + premine_max_size + claims_pool)
+                    <= NativeCurrencyAmount::coins(42000000)
+            );
+
+            // total: 41999999.9999999999999999999999985124612500
+            println!(
+                "total: {}",
+                (total_mined + premine_max_size + claims_pool).display_lossless()
+            );
+
+            assert_eq!(
+                (total_mined + premine_max_size + claims_pool).display_n_decimals(20),
+                NativeCurrencyAmount::coins(42000000).display_n_decimals(20),
+                "total mined: {}\npremine max size: {}\nclaims pool: {}\nsum is {}",
+                total_mined.display_n_decimals(20),
+                premine_max_size.display_n_decimals(20),
+                claims_pool.display_n_decimals(20),
+                (total_mined + premine_max_size + claims_pool).display_n_decimals(20)
+            );
         }
     }
 }

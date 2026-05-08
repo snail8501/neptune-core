@@ -3,15 +3,20 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::SystemTime;
 
+use libp2p::PeerId;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
 use crate::api::export::Network;
 use crate::application::config::cli_args;
-use crate::application::loops::channel::MainToPeerTask;
-use crate::application::loops::channel::PeerTaskToMain;
+use crate::application::config::parser::multiaddr::socketaddr_to_multiaddr;
+use crate::application::loops::peer_loop::channel::MainToPeerTask;
+use crate::application::loops::peer_loop::channel::PeerTaskToMain;
+use crate::application::network::channel::NetworkActorCommand;
+use crate::application::network::channel::NetworkEvent;
 use crate::protocol::consensus::block::Block;
 use crate::protocol::peer::handshake_data::VersionString;
+use crate::protocol::peer::peer_info::pseudorandom_peer_id;
 use crate::protocol::peer::peer_info::PeerConnectionInfo;
 use crate::protocol::peer::peer_info::PeerInfo;
 use crate::state::blockchain_state::BlockchainState;
@@ -33,14 +38,17 @@ use crate::VERSION;
 pub(crate) async fn mock_genesis_global_state_with_block(
     peer_count: u8,
     wallet: WalletEntropy,
-    cli: cli_args::Args,
+    mut cli: cli_args::Args,
     genesis_block: Block,
 ) -> GlobalStateLock {
     let data_dir = crate::tests::shared::files::unit_test_data_directory(cli.network).unwrap();
+
+    cli.second_parse().unwrap();
+
     let archival_state = crate::state::archival_state::ArchivalState::new(
         data_dir.clone(),
         genesis_block.clone(),
-        cli.network,
+        &cli,
     )
     .await;
 
@@ -51,7 +59,8 @@ pub(crate) async fn mock_genesis_global_state_with_block(
     for i in 0..peer_count {
         let peer_address =
             std::net::SocketAddr::from_str(&format!("123.123.123.{}:8080", i)).unwrap();
-        peer_map.insert(peer_address, get_dummy_peer_outgoing(peer_address));
+        let peer_id = pseudorandom_peer_id(&peer_address);
+        peer_map.insert(peer_id, get_dummy_peer_outgoing(peer_address));
     }
     let net = NetworkingState::new(peer_map, peer_db);
 
@@ -59,7 +68,7 @@ pub(crate) async fn mock_genesis_global_state_with_block(
     assert_eq!(archival_state.genesis_block().hash(), genesis_block.hash());
     assert_eq!(archival_state.get_tip().await.hash(), genesis_block.hash());
 
-    let light_state: LightState = LightState::from(genesis_block.to_owned());
+    let light_state: LightState = LightState::new(genesis_block.to_owned(), cli.network);
     let chain = BlockchainState::Archival(Box::new(
         crate::state::blockchain_state::BlockchainArchivalState {
             light_state,
@@ -122,8 +131,10 @@ pub(crate) async fn state_with_premine_and_self_mined_blocks<const NUM_BLOCKS_MI
         mock_genesis_global_state(2, wallet.clone(), cli_args.clone()).await;
     let mut previous_block = Block::genesis(network);
 
-    let guesser_key = wallet.guesser_fee_key();
-    let guesser_address = guesser_key.to_address();
+    let (guesser_address, _) = global_state_lock
+        .lock_guard()
+        .await
+        .mining_rewards_address();
     for coinbase_sender_randomness in coinbase_sender_randomness_coll {
         let (next_block, composer_utxos) =
             super::blocks::make_mock_block_with_puts_and_guesser_preimage_and_guesser_fraction(
@@ -133,7 +144,7 @@ pub(crate) async fn state_with_premine_and_self_mined_blocks<const NUM_BLOCKS_MI
                 None,
                 composer_key,
                 coinbase_sender_randomness,
-                (0.5, guesser_address.into()),
+                (0.5, guesser_address.clone()),
                 network,
             )
             .await;
@@ -154,7 +165,6 @@ pub(crate) async fn state_with_premine_and_self_mined_blocks<const NUM_BLOCKS_MI
 /// Returns:
 /// (peer_broadcast_channel, from_main_receiver, to_main_transmitter, to_main_receiver, global state, peer's handshake data)
 pub(crate) async fn get_test_genesis_setup(
-    network: Network,
     peer_count: u8,
     cli: cli_args::Args,
 ) -> anyhow::Result<(
@@ -162,15 +172,17 @@ pub(crate) async fn get_test_genesis_setup(
     broadcast::Receiver<MainToPeerTask>,
     mpsc::Sender<PeerTaskToMain>,
     mpsc::Receiver<PeerTaskToMain>,
+    mpsc::Sender<NetworkActorCommand>,
+    mpsc::Receiver<NetworkEvent>,
     GlobalStateLock,
     HandshakeData,
 )> {
+    let network = cli.network;
     let genesis = Block::genesis(network);
-    test_setup_custom_genesis_block(network, peer_count, cli, genesis).await
+    test_setup_custom_genesis_block(peer_count, cli, genesis).await
 }
 
 pub(crate) async fn test_setup_custom_genesis_block(
-    network: Network,
     peer_count: u8,
     cli: cli_args::Args,
     custom_genesis: Block,
@@ -179,13 +191,20 @@ pub(crate) async fn test_setup_custom_genesis_block(
     broadcast::Receiver<MainToPeerTask>,
     mpsc::Sender<PeerTaskToMain>,
     mpsc::Receiver<PeerTaskToMain>,
+    mpsc::Sender<NetworkActorCommand>,
+    mpsc::Receiver<NetworkEvent>,
     GlobalStateLock,
     HandshakeData,
 )> {
     let (peer_broadcast_tx, from_main_rx) =
         broadcast::channel::<MainToPeerTask>(PEER_CHANNEL_CAPACITY);
     let (to_main_tx, to_main_rx) = mpsc::channel::<PeerTaskToMain>(PEER_CHANNEL_CAPACITY);
+    let (network_command_tx, _network_command_rx) =
+        mpsc::channel::<NetworkActorCommand>(PEER_CHANNEL_CAPACITY);
+    let (_network_event_tx, network_event_rx) =
+        mpsc::channel::<NetworkEvent>(PEER_CHANNEL_CAPACITY);
 
+    let network = cli.network;
     let wallet = WalletEntropy::devnet_wallet();
     let state = mock_genesis_global_state_with_block(peer_count, wallet, cli, custom_genesis).await;
     Ok((
@@ -193,13 +212,15 @@ pub(crate) async fn test_setup_custom_genesis_block(
         from_main_rx,
         to_main_tx,
         to_main_rx,
+        network_command_tx,
+        network_event_rx,
         state,
         get_dummy_handshake_data_for_genesis(network),
     ))
 }
 
 /// Return an empty peer map
-pub fn get_peer_map() -> HashMap<SocketAddr, PeerInfo> {
+pub fn get_peer_map() -> HashMap<PeerId, PeerInfo> {
     HashMap::new()
 }
 
@@ -209,7 +230,8 @@ pub fn get_dummy_socket_address(count: u8) -> SocketAddr {
 
 /// Get a dummy-peer representing an incoming connection.
 pub(crate) fn get_dummy_peer_incoming(address: SocketAddr) -> PeerInfo {
-    let peer_connection_info = PeerConnectionInfo::new(Some(8080), address, true);
+    let multiaddr = socketaddr_to_multiaddr(address);
+    let peer_connection_info = PeerConnectionInfo::new(Some(8080), multiaddr, true);
     let peer_handshake = get_dummy_handshake_data_for_genesis(Network::Main);
     PeerInfo::new(
         peer_connection_info,
@@ -221,7 +243,8 @@ pub(crate) fn get_dummy_peer_incoming(address: SocketAddr) -> PeerInfo {
 
 /// Get a dummy-peer representing an outgoing connection.
 pub(crate) fn get_dummy_peer_outgoing(address: SocketAddr) -> PeerInfo {
-    let peer_connection_info = PeerConnectionInfo::new(Some(8080), address, false);
+    let multiaddr = socketaddr_to_multiaddr(address);
+    let peer_connection_info = PeerConnectionInfo::new(Some(8080), multiaddr, false);
     let peer_handshake = get_dummy_handshake_data_for_genesis(Network::Main);
     PeerInfo::new(
         peer_connection_info,
@@ -232,7 +255,7 @@ pub(crate) fn get_dummy_peer_outgoing(address: SocketAddr) -> PeerInfo {
 }
 
 pub fn get_dummy_version() -> VersionString {
-    VersionString::try_from_str(VERSION).unwrap()
+    VersionString::new_from_str(VERSION)
 }
 
 /// Return a handshake object with a randomly set instance ID

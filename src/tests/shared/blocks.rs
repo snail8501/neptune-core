@@ -1,4 +1,5 @@
 use futures::channel::oneshot;
+use itertools::Itertools;
 use num_traits::Zero;
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -10,9 +11,11 @@ use tasm_lib::twenty_first::util_types::mmr::mmr_accumulator::MmrAccumulator;
 use twenty_first::math::b_field_element::BFieldElement;
 use twenty_first::util_types::mmr::mmr_trait::Mmr;
 
+use crate::api::export::Announcement;
 use crate::api::export::GenerationSpendingKey;
 use crate::api::export::GlobalStateLock;
 use crate::api::export::Network;
+use crate::api::export::OutputFormat;
 use crate::api::export::ReceivingAddress;
 use crate::api::export::Timestamp;
 use crate::application::config::fee_notification_policy::FeeNotificationPolicy;
@@ -21,8 +24,8 @@ use crate::application::loops::mine_loop::coinbase_distribution::CoinbaseDistrib
 use crate::application::loops::mine_loop::compose_block_helper;
 use crate::application::loops::mine_loop::composer_parameters::ComposerParameters;
 use crate::application::loops::mine_loop::guess_nonce;
+use crate::application::loops::mine_loop::guesser_configuration::GuessingConfiguration;
 use crate::application::loops::mine_loop::make_coinbase_transaction_stateless;
-use crate::application::loops::mine_loop::GuessingConfiguration;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::consensus::block::block_appendix::BlockAppendix;
 use crate::protocol::consensus::block::block_body::BlockBody;
@@ -46,14 +49,20 @@ use crate::protocol::consensus::transaction::transaction_kernel::TransactionKern
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
-use crate::protocol::proof_abstractions::verifier::cache_true_claim;
+use crate::protocol::proof_abstractions::verifier::cache_true_claims;
 use crate::state::wallet::address::generation_address;
 use crate::state::wallet::address::generation_address::GenerationReceivingAddress;
 use crate::state::wallet::expected_utxo::ExpectedUtxo;
+use crate::tests::shared::mock_tx::send_coins;
 use crate::tests::shared::Randomness;
 use crate::util_types::mutator_set::addition_record::AdditionRecord;
 use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
+use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
+use crate::util_types::mutator_set::removal_record::chunk_dictionary::ChunkDictionary;
 use crate::util_types::mutator_set::removal_record::RemovalRecord;
+use crate::util_types::mutator_set::shared::CHUNK_SIZE;
+use crate::util_types::mutator_set::shared::NUM_TRIALS;
+use crate::util_types::mutator_set::shared::WINDOW_SIZE;
 
 /// Create a valid block on top of provided block. Returned block is valid in
 /// terms of both block validity and PoW, and is thus the new canonical block of
@@ -76,16 +85,17 @@ pub(crate) async fn next_block(global_state_lock: GlobalStateLock, parent: Block
     .await
     .unwrap();
 
+    let height = child_no_pow.header().height;
+    if let Ok(status) = child_no_pow.header().pow.lustration_status() {
+        println!("Before guess: Lustration status, height {height}: {status}");
+    }
+
     let deterministic_guesser_rng = StdRng::seed_from_u64(55512345);
 
-    let guesser_address = global_state_lock
+    let (guesser_address, _) = global_state_lock
         .lock_guard()
         .await
-        .wallet_state
-        .wallet_entropy
-        .guesser_fee_key()
-        .to_address()
-        .into();
+        .mining_rewards_address();
     let new_timestamp = parent.header().timestamp + Timestamp::minutes(9);
     let (guesser_tx, guesser_rx) = oneshot::channel::<NewBlockFound>();
     guess_nonce(
@@ -103,7 +113,34 @@ pub(crate) async fn next_block(global_state_lock: GlobalStateLock, parent: Block
     .await;
     let child = *guesser_rx.await.unwrap().block;
 
+    if let Ok(status) = child.header().pow.lustration_status() {
+        println!("After guess: Lustration status, height {height}: {status}");
+    }
+
     child
+}
+
+/// Return a block with the specified puts, along with randomized
+/// composer rewards.
+pub(crate) async fn block_with_puts(
+    network: Network,
+    predecessor: &Block,
+    outputs: Vec<AdditionRecord>,
+    inputs: Vec<RemovalRecord>,
+) -> Block {
+    let mut rng = rand::rng();
+    let (block, _) = make_mock_block_with_inputs_and_outputs(
+        predecessor,
+        inputs,
+        outputs,
+        None,
+        GenerationSpendingKey::derive_from_seed(rng.random()),
+        rng.random(),
+        network,
+    )
+    .await;
+
+    block
 }
 
 /// Create an invalid block with the provided transaction kernel, using the
@@ -148,20 +185,18 @@ pub(crate) fn invalid_block_with_kernel_and_mutator_set(
     Block::new(block_header, body, appendix, BlockProof::Invalid)
 }
 
-/// Create a block containing the supplied transaction.
-///
-/// The returned block has an invalid block proof.
-pub(crate) fn invalid_block_with_transaction(
+pub(crate) fn invalid_block_with_tx_kernel(
     previous_block: &Block,
-    transaction: Transaction,
+    tx_kernel: TransactionKernel,
 ) -> Block {
     // 60s min block time on main and testnet
     let minimum_block_time = Timestamp::seconds(60);
     let timestamp = Timestamp::max(
         previous_block.header().timestamp + minimum_block_time,
-        transaction.kernel.timestamp,
+        tx_kernel.timestamp,
     );
     let new_block_height: BlockHeight = previous_block.kernel.header.height.next();
+    let difficulty = previous_block.header().difficulty;
     let block_header = BlockHeader {
         version: bfe!(0),
         height: new_block_height,
@@ -169,23 +204,20 @@ pub(crate) fn invalid_block_with_transaction(
         timestamp,
         pow: Pow::default(),
         guesser_receiver_data: GuesserReceiverData::default(),
-        cumulative_proof_of_work: previous_block.header().cumulative_proof_of_work,
-        difficulty: previous_block.header().difficulty,
+        cumulative_proof_of_work: previous_block.header().cumulative_proof_of_work + difficulty,
+        difficulty,
     };
 
     let mut next_mutator_set = previous_block.mutator_set_accumulator_after().unwrap();
     let mut block_mmr = previous_block.kernel.body.block_mmr_accumulator.clone();
     block_mmr.append(previous_block.hash());
 
-    let ms_update = MutatorSetUpdate::new(
-        transaction.kernel.inputs.clone(),
-        transaction.kernel.outputs.clone(),
-    );
+    let ms_update = MutatorSetUpdate::new(tx_kernel.inputs.clone(), tx_kernel.outputs.clone());
     ms_update
         .apply_to_accumulator(&mut next_mutator_set)
         .unwrap();
 
-    let transaction = BlockTransaction::upgrade(transaction);
+    let transaction = BlockTransaction::from_tx_kernel(tx_kernel);
     let body = BlockBody::new(
         transaction.kernel.into(),
         next_mutator_set,
@@ -195,6 +227,16 @@ pub(crate) fn invalid_block_with_transaction(
     let appendix = BlockAppendix::default();
 
     Block::new(block_header, body, appendix, BlockProof::Invalid)
+}
+
+/// Create a block containing the supplied transaction.
+///
+/// The returned block has an invalid block proof.
+pub(crate) fn invalid_block_with_transaction(
+    previous_block: &Block,
+    transaction: Transaction,
+) -> Block {
+    invalid_block_with_tx_kernel(previous_block, transaction.kernel)
 }
 
 /// Build a fake and invalid block where the caller can specify the
@@ -234,12 +276,15 @@ pub(crate) async fn make_mock_block_with_puts_and_guesser_preimage_and_guesser_f
         ..Default::default()
     };
 
+    let consensus_rule_set =
+        ConsensusRuleSet::infer_from(network, previous_block.header().height.next());
     let (mut transaction, composer_txos) = make_coinbase_transaction_stateless(
         previous_block,
         composer_parameters,
         block_timestamp,
         TritonVmJobQueue::get_instance(),
         cli.proof_job_options_primitive_witness(),
+        consensus_rule_set,
     )
     .await
     .unwrap();
@@ -277,6 +322,53 @@ pub(crate) async fn make_mock_block_with_puts_and_guesser_preimage_and_guesser_f
         .collect();
 
     (block, composer_expected_utxos)
+}
+
+/// Return a block with the specied number of inputs/outputs. Inputs and
+/// outputs are random. Also contains randomized composer rewards.
+///
+/// Does not have a valid proof, nor valid PoW. Not deterministic.
+pub(crate) async fn block_with_num_puts(
+    network: Network,
+    predecessor: &Block,
+    num_inputs: u128,
+    num_outputs: usize,
+) -> Block {
+    let mut rng = rand::rng();
+    let active_window_start = u128::from(
+        predecessor
+            .mutator_set_accumulator_after()
+            .unwrap()
+            .get_batch_index(),
+    ) * u128::from(CHUNK_SIZE);
+    let inputs = (0..num_inputs)
+        .map(|_| RemovalRecord {
+            absolute_indices: AbsoluteIndexSet::new(
+                (0..NUM_TRIALS)
+                    .map(|_| rng.random_range(u128::from(CHUNK_SIZE * 3)..u128::from(WINDOW_SIZE)))
+                    .map(|ri| ri + active_window_start)
+                    .collect_vec()
+                    .try_into()
+                    .unwrap(),
+            ),
+            target_chunks: ChunkDictionary::default(),
+        })
+        .collect_vec();
+
+    let outputs = vec![rng.random(); num_outputs];
+
+    let (block, _) = make_mock_block_with_inputs_and_outputs(
+        predecessor,
+        inputs,
+        outputs,
+        None,
+        GenerationSpendingKey::derive_from_seed(rng.random()),
+        rng.random(),
+        network,
+    )
+    .await;
+
+    block
 }
 
 /// Build a fake block with a random hash, containing *two* outputs for the
@@ -340,36 +432,27 @@ pub(crate) async fn mine_block_to_wallet_invalid_block_proof(
     global_state_lock: &mut GlobalStateLock,
     timestamp: Option<Timestamp>,
 ) -> anyhow::Result<Block> {
-    let tip_block = global_state_lock
-        .lock_guard()
-        .await
-        .chain
-        .light_state()
-        .to_owned();
+    let tip = global_state_lock.lock_guard().await.chain.tip().to_owned();
 
-    let timestamp =
-        timestamp.unwrap_or_else(|| tip_block.header().timestamp + Timestamp::minutes(10));
+    let timestamp = timestamp.unwrap_or_else(|| tip.header().timestamp + Timestamp::minutes(10));
 
     let (transaction, expected_composer_utxos) =
         crate::application::loops::mine_loop::create_block_transaction(
-            &tip_block,
+            &tip,
             global_state_lock.clone(),
             timestamp,
             Default::default(),
         )
         .await?;
 
-    let guesser_key = global_state_lock
+    let (guesser_address, _) = global_state_lock
         .lock_guard()
         .await
-        .wallet_state
-        .wallet_entropy
-        .guesser_fee_key();
-    let guesser_address = guesser_key.to_address();
+        .mining_rewards_address();
     let network = global_state_lock.cli().network;
     let mut block =
-        Block::block_template_invalid_proof(&tip_block, transaction, timestamp, None, network);
-    block.set_header_guesser_address(guesser_address.into());
+        Block::block_template_invalid_proof(&tip, transaction, timestamp, None, network);
+    block.set_header_guesser_address(guesser_address);
 
     global_state_lock
         .set_new_self_composed_tip(block.clone(), expected_composer_utxos)
@@ -445,6 +528,28 @@ pub(crate) fn invalid_empty_blocks_with_proof_size(
     blocks
 }
 
+pub(crate) fn invalid_empty_block_with_announcements(
+    predecessor: &Block,
+    network: Network,
+    announcements: Vec<Announcement>,
+) -> Block {
+    let tx = crate::tests::shared::mock_tx::make_mock_transaction_with_mutator_set_hash(
+        vec![],
+        vec![],
+        predecessor.mutator_set_accumulator_after().unwrap().hash(),
+    );
+    let kernel = TransactionKernelModifier::default()
+        .announcements(announcements)
+        .clone_modify(&tx.kernel);
+    let tx = Transaction {
+        kernel,
+        proof: tx.proof,
+    };
+    let timestamp = predecessor.header().timestamp + Timestamp::hours(1);
+    let tx = BlockTransaction::upgrade(tx);
+    Block::block_template_invalid_proof(predecessor, tx, timestamp, None, network)
+}
+
 /// Return a list of `n` invalid, empty blocks.
 pub(crate) fn invalid_empty_blocks(ancestor: &Block, n: usize, network: Network) -> Vec<Block> {
     let mut blocks = vec![];
@@ -489,7 +594,7 @@ pub(crate) async fn fake_valid_block_proposal_from_tx(
         let block_proof_witness = BlockProofWitness::produce(primitive_witness);
         let appendix = block_proof_witness.appendix();
         let claim = BlockProgram::claim(&body, &appendix);
-        cache_true_claim(claim.clone()).await;
+        cache_true_claims([claim.clone()]).await;
         (appendix, BlockProof::SingleProof(Proof::invalid()))
     };
 
@@ -504,7 +609,8 @@ async fn fake_valid_block_from_block_tx_for_tests(
     network: Network,
 ) -> Block {
     let mut block = fake_valid_block_proposal_from_tx(predecessor, tx, network).await;
-    let block_height = predecessor.header().height;
+
+    let block_height = block.header().height;
     let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
     block.satisfy_pow(predecessor.header().difficulty, consensus_rule_set);
 
@@ -610,7 +716,7 @@ pub(crate) async fn fake_valid_block_for_tests(
     state_lock: &GlobalStateLock,
     rness: Randomness<2, 2>,
 ) -> Block {
-    let current_tip = state_lock.lock_guard().await.chain.light_state().clone();
+    let current_tip = state_lock.lock_guard().await.chain.tip().to_owned();
     fake_valid_successor_for_tests(
         &current_tip,
         current_tip.header().timestamp + Timestamp::hours(1),
@@ -668,6 +774,20 @@ pub(crate) async fn fake_valid_sequence_of_blocks_for_tests_dyn(
         predecessor = blocks.last().unwrap();
     }
     blocks
+}
+
+/// Build a block with the specified outputs. Includes change outputs if
+/// balance exceeds output value. Notifies wallet of expected incoming
+/// UTXOs that can be claimed from the transaction.
+pub(crate) async fn block_with_outputs(
+    gsl: &mut GlobalStateLock,
+    outputs: impl IntoIterator<Item = impl Into<OutputFormat>>,
+) -> Block {
+    let light_state = gsl.lock_guard().await.chain.light_state_clone();
+    let parent_block = light_state.tip();
+    let timestamp = parent_block.header().timestamp + Timestamp::months(7);
+    let tx = send_coins(gsl, outputs, timestamp).await;
+    invalid_block_with_transaction(parent_block, tx)
 }
 
 mod tests {

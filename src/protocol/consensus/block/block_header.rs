@@ -24,6 +24,7 @@ use crate::api::export::ReceivingAddress;
 use crate::application::config::network::Network;
 use crate::protocol::consensus::block::guesser_receiver_data::GuesserReceiverData;
 use crate::protocol::consensus::block::pow::Pow;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::proof_abstractions::mast_hash::HasDiscriminant;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
@@ -146,6 +147,7 @@ impl BlockHeader {
         predecessor_digest: Digest,
         timestamp: Timestamp,
         target_block_interval: Timestamp,
+        network: Network,
     ) -> BlockHeader {
         let difficulty = difficulty_control(
             timestamp,
@@ -155,11 +157,18 @@ impl BlockHeader {
             predecessor_header.height,
         );
 
+        let new_height = predecessor_header.height.next();
+        let consensus_rules = ConsensusRuleSet::infer_from(network, new_height);
+        let delta_cum_pow = if consensus_rules.use_parent_difficulty() {
+            predecessor_header.difficulty
+        } else {
+            difficulty
+        };
         let new_cumulative_proof_of_work: ProofOfWork =
-            predecessor_header.cumulative_proof_of_work + predecessor_header.difficulty;
+            predecessor_header.cumulative_proof_of_work + delta_cum_pow;
         Self {
             version: BLOCK_HEADER_VERSION,
-            height: predecessor_header.height.next(),
+            height: new_height,
             prev_block_digest: predecessor_digest,
             timestamp,
             pow: Pow::default(),
@@ -241,6 +250,12 @@ impl From<&Block> for HeaderToBlockHashWitness {
     }
 }
 
+impl HeaderToBlockHashWitness {
+    pub(crate) fn proof_leaf(&self) -> Digest {
+        self.proof_leaf
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct BlockHeaderWithBlockHashWitness {
     pub(crate) header: BlockHeader,
@@ -273,56 +288,7 @@ impl BlockHeaderWithBlockHashWitness {
     }
 }
 
-#[cfg(any(test, feature = "arbitrary-impls"))]
-impl BlockHeader {
-    pub(crate) fn arbitrary_with_height_and_difficulty(
-        height: BlockHeight,
-        difficulty: Difficulty,
-    ) -> proptest::prelude::BoxedStrategy<Self> {
-        use proptest::prelude::Strategy;
-        use proptest_arbitrary_interop::arb;
-
-        let version = arb::<BFieldElement>();
-        let prev_block_digest = arb::<Digest>();
-        let timestamp = arb::<Timestamp>();
-        let pow = arb::<BlockPow>();
-        let cumulative_proof_of_work = arb::<ProofOfWork>();
-        let guesser_receiver_data = arb::<GuesserReceiverData>();
-
-        (
-            version,
-            prev_block_digest,
-            timestamp,
-            pow,
-            cumulative_proof_of_work,
-            guesser_receiver_data,
-        )
-            .prop_map(
-                move |(
-                    version,
-                    prev_block_digest,
-                    timestamp,
-                    pow,
-                    cumulative_proof_of_work,
-                    guesser_receiver_data,
-                )| {
-                    BlockHeader {
-                        version,
-                        height,
-                        prev_block_digest,
-                        timestamp,
-                        pow,
-                        cumulative_proof_of_work,
-                        difficulty,
-                        guesser_receiver_data,
-                    }
-                },
-            )
-            .boxed()
-    }
-}
-
-#[cfg(feature = "mock-rpc")]
+#[cfg(any(feature = "mock-rpc", test))]
 impl rand::distr::Distribution<BlockHeader> for rand::distr::StandardUniform {
     fn sample<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> BlockHeader {
         BlockHeader {
@@ -344,31 +310,60 @@ pub(crate) mod tests {
     use rand::rng;
     use rand::Rng;
 
+    impl BlockHeader {
+        pub(crate) fn arbitrary_with_height_and_difficulty(
+            height: BlockHeight,
+            difficulty: Difficulty,
+        ) -> proptest::prelude::BoxedStrategy<Self> {
+            use proptest::prelude::Strategy;
+            use proptest_arbitrary_interop::arb;
+
+            let version = arb::<BFieldElement>();
+            let prev_block_digest = arb::<Digest>();
+            let timestamp = arb::<Timestamp>();
+            let pow = arb::<BlockPow>();
+            let cumulative_proof_of_work = arb::<ProofOfWork>();
+            let guesser_receiver_data = arb::<GuesserReceiverData>();
+
+            (
+                version,
+                prev_block_digest,
+                timestamp,
+                pow,
+                cumulative_proof_of_work,
+                guesser_receiver_data,
+            )
+                .prop_map(
+                    move |(
+                        version,
+                        prev_block_digest,
+                        timestamp,
+                        pow,
+                        cumulative_proof_of_work,
+                        guesser_receiver_data,
+                    )| {
+                        BlockHeader {
+                            version,
+                            height,
+                            prev_block_digest,
+                            timestamp,
+                            pow,
+                            cumulative_proof_of_work,
+                            difficulty,
+                            guesser_receiver_data,
+                        }
+                    },
+                )
+                .boxed()
+        }
+    }
+
     use super::*;
     use crate::tests::shared::blocks::invalid_empty_block_with_proof_size;
 
     impl BlockHeader {
         pub(crate) fn set_nonce(&mut self, nonce: Digest) {
             self.pow.nonce = nonce;
-        }
-    }
-
-    pub(crate) fn random_block_header() -> BlockHeader {
-        let mut rng = rand::rng();
-        BlockHeader {
-            version: rng.random(),
-            height: BlockHeight::from(rng.random::<u64>()),
-            prev_block_digest: rng.random(),
-            timestamp: rng.random(),
-            pow: rng.random(),
-            cumulative_proof_of_work: ProofOfWork::new(
-                rng.random::<[u32; ProofOfWork::NUM_LIMBS]>(),
-            ),
-            difficulty: Difficulty::new(rng.random::<[u32; Difficulty::NUM_LIMBS]>()),
-            guesser_receiver_data: GuesserReceiverData {
-                receiver_digest: rng.random(),
-                lock_script_hash: rng.random(),
-            },
         }
     }
 
@@ -399,7 +394,7 @@ pub(crate) mod tests {
 
     #[test]
     fn block_header_display_impl() {
-        let block_header = random_block_header();
+        let block_header = rng().random::<BlockHeader>();
         println!("{block_header}");
     }
 }

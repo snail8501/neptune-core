@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 use crate::api::tx_initiation::builder::proof_builder::ProofBuilder;
 use crate::api::tx_initiation::error::CreateProofError;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+use crate::protocol::consensus::consensus_rule_set::TritonProofVersion;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::triton_vm::prelude::*;
 use itertools::Itertools;
@@ -33,7 +34,7 @@ use crate::protocol::consensus::transaction::validity::tasm::claims::generate_ty
 use crate::protocol::consensus::transaction::validity::tasm::claims::generate_rri_claim::GenerateRriClaim;
 use crate::protocol::consensus::transaction::Claim;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+use crate::protocol::proof_abstractions::tasm::program::TritonProgram;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::proof_abstractions::SecretWitness;
 use crate::BFieldElement;
@@ -68,7 +69,7 @@ impl SingleProofWitness {
         Self::Update(witness)
     }
 
-    pub(crate) fn from_merge(merge_witness: MergeWitness) -> Self {
+    pub fn from_merge(merge_witness: MergeWitness) -> Self {
         Self::Merger(merge_witness)
     }
 }
@@ -280,8 +281,9 @@ pub(crate) async fn produce_single_proof(
     proof_job_options: TritonVmProofJobOptions,
     consensus_rule_set: ConsensusRuleSet,
 ) -> Result<Proof, CreateProofError> {
-    match consensus_rule_set {
-        ConsensusRuleSet::Reboot | ConsensusRuleSet::HardforkAlpha => {
+    match consensus_rule_set.triton_proof_version() {
+        TritonProofVersion::V0 => Err(CreateProofError::DeprecatedTritonVmVersion),
+        TritonProofVersion::V1 => {
             SingleProof::produce(primitive_witness, triton_vm_job_queue, proof_job_options).await
         }
     }
@@ -290,29 +292,31 @@ pub(crate) async fn produce_single_proof(
 /// Not to be confused with SingleProofWitness::claim
 ///
 /// Consensus rule set refers to the rule set for which the claim must be valid.
-//
-// This function calls SingleProof::claim but with the correct merge version.
 pub(crate) fn single_proof_claim(
     tx_kernel_mast_hash: Digest,
     consensus_rule_set: ConsensusRuleSet,
 ) -> Claim {
-    match consensus_rule_set {
-        ConsensusRuleSet::Reboot | ConsensusRuleSet::HardforkAlpha => {
-            SingleProof::claim(tx_kernel_mast_hash)
+    const V0_SINGLE_PROOF_PROGRAM_DIGEST: &str =
+        "9ed47e4aff83681ce46618c59971cc5eca2ef5a063b3f35828946f4810295871338072751af633e0";
+    match consensus_rule_set.triton_proof_version() {
+        TritonProofVersion::V0 => {
+            Claim::new(Digest::try_from_hex(V0_SINGLE_PROOF_PROGRAM_DIGEST).unwrap())
+                .about_version(0)
+                .with_input(tx_kernel_mast_hash.reversed().values().to_vec())
         }
+        TritonProofVersion::V1 => SingleProof::claim(tx_kernel_mast_hash),
     }
 }
 
 pub(crate) fn produce_single_proof_mock(valid_mock: bool) -> Proof {
-    let claim = Claim::new(Digest::default());
     if valid_mock {
-        Proof::valid_mock(claim)
+        Proof::valid_mock()
     } else {
-        Proof::invalid_mock(claim)
+        Proof::invalid_mock()
     }
 }
 
-impl ConsensusProgram for SingleProof {
+impl TritonProgram for SingleProof {
     fn library_and_code(&self) -> (Library, Vec<LabelledInstruction>) {
         let mut library = Library::new();
 
@@ -775,12 +779,12 @@ pub(crate) mod tests {
     use crate::protocol::consensus::type_scripts::time_lock::neptune_arbitrary::arbitrary_primitive_witness_with_expired_timelocks;
     use crate::protocol::proof_abstractions::tasm::builtins as tasm;
     use crate::protocol::proof_abstractions::tasm::program::tests::test_program_snapshot;
-    use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
-    use crate::protocol::proof_abstractions::tasm::program::ConsensusError;
+    use crate::protocol::proof_abstractions::tasm::program::spec::TritonProgramSpecification;
+    use crate::protocol::proof_abstractions::tasm::program::TritonError;
     use crate::protocol::proof_abstractions::timestamp::Timestamp;
     use crate::tests::shared_tokio_runtime;
 
-    impl ConsensusProgramSpecification for SingleProof {
+    impl TritonProgramSpecification for SingleProof {
         fn source(&self) {
             let stark: Stark = Stark::default();
             let own_program_digest: Digest = tasm::own_program_digest();
@@ -872,7 +876,7 @@ pub(crate) mod tests {
 
             let consensus_err = SingleProof.run_tasm(&pub_input, nondeterminism.clone());
 
-            let_assert!(Err(ConsensusError::TritonVMPanic(_, instruction_err)) = consensus_err);
+            let_assert!(Err(TritonError::TritonVMPanic(_, instruction_err)) = consensus_err);
             let_assert!(InstructionError::AssertionFailed(assertion_err) = instruction_err);
             let_assert!(Some(err_id) = assertion_err.id);
             assert_eq!(INVALID_WITNESS_DISCRIMINANT_ERROR, err_id);
@@ -1307,6 +1311,6 @@ pub(crate) mod tests {
 
     test_program_snapshot!(
         SingleProof,
-        "9ed47e4aff83681ce46618c59971cc5eca2ef5a063b3f35828946f4810295871338072751af633e0"
+        "151b31a62b85f6c4e1c792c7c1e7934ecc44430eb1209e816a47a7f0d2c10d1002f74f8cda8e4f8a"
     );
 }

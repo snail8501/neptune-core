@@ -29,20 +29,20 @@ use crate::protocol::consensus::transaction::transaction_kernel::TransactionKern
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+use crate::protocol::proof_abstractions::tasm::program::TritonProgram;
 use crate::protocol::proof_abstractions::verifier::verify;
 
 /// Verifies that all claims listed in the appendix are true.
 ///
-/// The witness for this program is [`BlockProofWitness`].
+/// The witness for this program is `BlockProofWitness`.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BlockProgram;
+pub struct BlockProgram;
 
 impl BlockProgram {
     const ILLEGAL_FEE: i128 = 1_000_210;
     const PROOF_SIZE_INDICATOR_TOO_BIG: i128 = 1_000_211;
 
-    pub(crate) fn claim(block_body: &BlockBody, appendix: &BlockAppendix) -> Claim {
+    pub fn claim(block_body: &BlockBody, appendix: &BlockAppendix) -> Claim {
         Claim::new(Self.hash())
             .with_input(block_body.mast_hash().reversed().values().to_vec())
             .with_output(appendix.claims_as_output())
@@ -65,7 +65,7 @@ impl BlockProgram {
     }
 }
 
-impl ConsensusProgram for BlockProgram {
+impl TritonProgram for BlockProgram {
     fn library_and_code(&self) -> (Library, Vec<LabelledInstruction>) {
         // restrict proof size to avoid jumping backwards or to arbitrary
         // place in memory.
@@ -355,8 +355,8 @@ pub(crate) mod tests {
     use crate::protocol::consensus::transaction::Transaction;
     use crate::protocol::proof_abstractions::tasm::builtins as tasm;
     use crate::protocol::proof_abstractions::tasm::builtins::verify_stark;
+    use crate::protocol::proof_abstractions::tasm::program::spec::TritonProgramSpecification;
     use crate::protocol::proof_abstractions::tasm::program::tests::test_program_snapshot;
-    use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
     use crate::protocol::proof_abstractions::timestamp::Timestamp;
     use crate::protocol::proof_abstractions::SecretWitness;
     use crate::state::transaction::tx_creation_config::TxCreationConfig;
@@ -367,7 +367,7 @@ pub(crate) mod tests {
     use crate::tests::shared_tokio_runtime;
     use crate::GlobalStateLock;
 
-    impl ConsensusProgramSpecification for BlockProgram {
+    impl TritonProgramSpecification for BlockProgram {
         fn source(&self) {
             let block_body_digest: Digest = tasm::tasmlib_io_read_stdin___digest();
             let start_address: BFieldElement =
@@ -468,7 +468,7 @@ pub(crate) mod tests {
     #[apply(shared_tokio_runtime)]
     async fn disallow_double_spends_across_blocks() {
         async fn mine_tx(state: &GlobalStateLock, tx: Transaction, timestamp: Timestamp) -> Block {
-            let predecessor = state.lock_guard().await.chain.light_state().to_owned();
+            let predecessor = state.lock_guard().await.chain.tip().to_owned();
             let (block_tx, _) = create_block_transaction_from(
                 &predecessor,
                 state.clone(),
@@ -480,7 +480,7 @@ pub(crate) mod tests {
             .unwrap();
 
             Block::compose(
-                &predecessor,
+                predecessor,
                 block_tx,
                 timestamp,
                 TritonVmJobQueue::get_instance(),
@@ -544,7 +544,7 @@ pub(crate) mod tests {
         let block2 = mine_tx(&alice, tx, later).await;
         assert_eq!(
             BlockValidationError::RemovalRecordsValidity,
-            block2.validate(&block1, later, network).await.unwrap_err(),
+            block2.validate(&block1, later, network,).await.unwrap_err(),
             "Block doing a double-spend must be invalid."
         );
     }
@@ -604,7 +604,6 @@ pub(crate) mod tests {
 
     test_program_snapshot!(
         BlockProgram,
-        // snapshot taken from master on 2025-04-11 e2a712efc34f78c6a28801544418e7051127d284
-        "2a3126ef86970a4a8df02711c2fbb4e5c9e025e257e0d169aab38114737a4cb9c84f9985b679c55a"
+        "72d46afed8a1bf162814a432cf1ebe0f16a1cdb84bd339badc6fbd499172c3474c285dd0d5ba4e0c"
     );
 }

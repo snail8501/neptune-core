@@ -83,6 +83,13 @@ impl ReceivingAddress {
         }
     }
 
+    pub(crate) fn flag(&self) -> BFieldElement {
+        match self {
+            ReceivingAddress::Generation(addr) => addr.flag(),
+            ReceivingAddress::Symmetric(addr) => addr.flag(),
+        }
+    }
+
     /// generates a [Announcement] for an output Utxo
     ///
     /// The announcement contains a [`Vec<BFieldElement>`] with fields:
@@ -251,10 +258,7 @@ impl ReceivingAddress {
 
     /// returns human-readable-prefix (hrp) for a given network
     pub fn get_hrp(&self, network: Network) -> String {
-        match self {
-            Self::Generation(_) => generation_address::GenerationReceivingAddress::get_hrp(network),
-            Self::Symmetric(_) => symmetric_key::SymmetricKey::get_hrp(network).to_string(),
-        }
+        KeyType::from(self).get_hrp(network)
     }
 
     /// Returns the address's lock script hash.

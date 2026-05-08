@@ -9,6 +9,7 @@ use super::common;
 use super::generation_address;
 use super::receiving_address::ReceivingAddress;
 use super::symmetric_key;
+use crate::api::export::Network;
 use crate::protocol::consensus::transaction::announcement::Announcement;
 use crate::protocol::consensus::transaction::lock_script::LockScript;
 use crate::protocol::consensus::transaction::lock_script::LockScriptAndWitness;
@@ -17,9 +18,11 @@ use crate::protocol::consensus::transaction::utxo::Utxo;
 use crate::state::wallet::incoming_utxo::IncomingUtxo;
 use crate::BFieldElement;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, strum::EnumString)]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 #[cfg_attr(test, derive(strum::EnumIter))]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum KeyType {
     /// [generation_address] built on [crate::prelude::twenty_first::math::lattice::kem]
     ///
@@ -80,6 +83,14 @@ impl KeyType {
     pub fn all_types() -> Vec<KeyType> {
         vec![Self::Generation, Self::Symmetric]
     }
+
+    /// returns human-readable-prefix (hrp) for a given network
+    pub fn get_hrp(&self, network: Network) -> String {
+        match self {
+            Self::Generation => generation_address::GenerationReceivingAddress::get_hrp(network),
+            Self::Symmetric => symmetric_key::SymmetricKey::get_hrp(network).to_string(),
+        }
+    }
 }
 
 /// Represents cryptographic data necessary for spending funds (or, more
@@ -132,7 +143,7 @@ impl SpendingKey {
     }
 
     /// Return the lock script and its witness
-    pub(crate) fn lock_script_and_witness(&self) -> LockScriptAndWitness {
+    pub fn lock_script_and_witness(&self) -> LockScriptAndWitness {
         match self {
             SpendingKey::Generation(generation_spending_key) => {
                 generation_spending_key.lock_script_and_witness()
@@ -147,7 +158,7 @@ impl SpendingKey {
         }
     }
 
-    pub(crate) fn lock_script_hash(&self) -> Digest {
+    pub fn lock_script_hash(&self) -> Digest {
         self.lock_script().hash()
     }
 
@@ -200,7 +211,9 @@ impl SpendingKey {
     }
 
     /// Scans all announcements in a `Transaction` and return all
-    /// UTXOs that are recognized by this spending key.
+    /// UTXOs that are announced and recognized by this spending key. Does not
+    /// verify that the announced UTXOs are actually present. This is the
+    /// caller's responsibility..
     ///
     /// Note that a single `Transaction` may represent an entire block.
     ///
@@ -208,10 +221,12 @@ impl SpendingKey {
     ///
     ///  - Logs a warning for any announcement targeted at this key that cannot
     ///    be decrypted.
-    pub(crate) fn scan_for_announced_utxos(
-        &self,
-        tx_kernel: &TransactionKernel,
-    ) -> Vec<IncomingUtxo> {
+    ///
+    /// # Warning
+    ///
+    /// Only scans the matching announcements. Does not verify that the
+    /// announced UTXO is actually an output in the transaction.
+    pub fn scan_for_announced_utxos(&self, tx_kernel: &TransactionKernel) -> Vec<IncomingUtxo> {
         // pre-compute some fields, and early-abort if key cannot receive.
         let receiver_identifier = self.receiver_identifier();
         let receiver_preimage = self.privacy_preimage();
@@ -262,5 +277,36 @@ impl SpendingKey {
     /// returns true if the [Announcement] has a type-flag that matches the type of this key
     pub(super) fn matches_announcement_key_type(&self, pa: &Announcement) -> bool {
         matches!(KeyType::try_from(pa), Ok(kt) if kt == KeyType::from(self))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use strum::IntoEnumIterator;
+
+    use super::*;
+
+    #[test]
+    fn keytype_to_string_is_as_defined() {
+        assert_eq!(KeyType::Generation.to_string(), "Generation");
+        assert_eq!(KeyType::Symmetric.to_string(), "Symmetric");
+    }
+
+    #[test]
+    fn keytype_from_str_works_when_all_lowercase() {
+        assert_eq!(
+            KeyType::Generation,
+            KeyType::from_str("generation").unwrap()
+        );
+        assert_eq!(KeyType::Symmetric, KeyType::from_str("symmetric").unwrap());
+    }
+
+    #[test]
+    fn keytype_string_roundtrip() {
+        for v in KeyType::iter() {
+            assert_eq!(v, KeyType::from_str(&v.to_string()).unwrap());
+        }
     }
 }

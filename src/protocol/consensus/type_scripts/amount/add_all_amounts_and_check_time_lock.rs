@@ -35,7 +35,7 @@ impl AddAllAmountsAndCheckTimeLock {
 }
 
 impl BasicSnippet for AddAllAmountsAndCheckTimeLock {
-    fn inputs(&self) -> Vec<(DataType, String)> {
+    fn parameters(&self) -> Vec<(DataType, String)> {
         vec![
             (DataType::U32, "num_coins".to_string()),
             (DataType::U32, "index".to_string()),
@@ -47,7 +47,7 @@ impl BasicSnippet for AddAllAmountsAndCheckTimeLock {
         ]
     }
 
-    fn outputs(&self) -> Vec<(DataType, String)> {
+    fn return_values(&self) -> Vec<(DataType, String)> {
         vec![
             (DataType::U32, "num_coins".to_string()),
             (DataType::U32, "num_coins".to_string()),
@@ -191,7 +191,7 @@ impl BasicSnippet for AddAllAmountsAndCheckTimeLock {
 mod test {
     use crate::protocol::consensus::type_scripts::amount::add_all_amounts_and_check_time_lock::AddAllAmountsAndCheckTimeLock;
     use crate::protocol::consensus::type_scripts::time_lock::TimeLock;
-    use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+    use crate::protocol::proof_abstractions::tasm::program::TritonProgram;
 
     #[test]
     fn hardcoded_time_lock_hash_matches_hash_of_time_lock_program() {

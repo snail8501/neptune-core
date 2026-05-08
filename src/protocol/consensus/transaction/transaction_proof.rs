@@ -18,23 +18,25 @@ use crate::protocol::proof_abstractions::verifier::verify;
 ///
 /// the types are ordered (asc) by proof-generation complexity.
 #[derive(Clone, Debug, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, strum::Display)]
+#[cfg_attr(any(test, feature = "arbitrary-impls"), derive(arbitrary::Arbitrary))]
 #[repr(u8)]
 pub enum TransactionProofType {
-    /// a primitive-witness.  exposes secrets (keys).  this proof must not be shared.
-    PrimitiveWitness = 1,
-    /// a weak proof that does not expose secrets. can be shared with peers, but cannot be confirmed into a block.
+    // Enumeration here must match that used in TxProvingCapability.
+    /// Exposes secrets (keys) and privacy. This proof must not be shared.
+    PrimitiveWitness = 0,
+
+    // LockScript = 1,
+    /// A proof that does not expose secrets or privacy. Can be shared with
+    /// peers, but cannot be confirmed into a block.
     ProofCollection = 2,
-    /// a strong proof.  required for confirming a transaction into a block.
+
+    /// Required for confirming a transaction into a block.
     SingleProof = 3,
 }
 
 impl From<&TransactionProof> for TransactionProofType {
     fn from(proof: &TransactionProof) -> Self {
-        match *proof {
-            TransactionProof::Witness(_) => Self::PrimitiveWitness,
-            TransactionProof::ProofCollection(_) => Self::ProofCollection,
-            TransactionProof::SingleProof(_) => Self::SingleProof,
-        }
+        proof.proof_type()
     }
 }
 
@@ -127,6 +129,14 @@ impl TransactionProof {
         }
     }
 
+    pub(crate) fn proof_type(&self) -> TransactionProofType {
+        match self {
+            TransactionProof::Witness(_) => TransactionProofType::PrimitiveWitness,
+            TransactionProof::ProofCollection(_) => TransactionProofType::ProofCollection,
+            TransactionProof::SingleProof(_) => TransactionProofType::SingleProof,
+        }
+    }
+
     /// verify this proof is valid for a provided transaction id.
     ///
     /// Block height is the height of the block that matches the transaction's
@@ -180,6 +190,22 @@ mod tests {
     use super::*;
     use crate::twenty_first::bfe_vec;
     use crate::BFieldElement;
+
+    impl TransactionProofType {
+        pub(crate) fn invalid(self) -> TransactionProof {
+            match self {
+                TransactionProofType::PrimitiveWitness => {
+                    TransactionProof::Witness(PrimitiveWitness::invalid())
+                }
+                TransactionProofType::ProofCollection => {
+                    TransactionProof::ProofCollection(ProofCollection::invalid())
+                }
+                TransactionProofType::SingleProof => {
+                    TransactionProof::SingleProof(NeptuneProof::from(vec![]))
+                }
+            }
+        }
+    }
 
     impl TransactionProof {
         /// A proof that will always be invalid

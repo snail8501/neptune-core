@@ -29,6 +29,12 @@ pub enum JsonError {
     InvalidParams,
     #[error("Internal error")]
     InternalError,
+    #[error("connection failed: {message}")]
+    ConnectionFailed { message: String },
+    #[error("HTTP error: {message}")]
+    HttpError { message: String },
+    #[error("Request body too big. Max: {max}; got: {got}")]
+    RequestBodyTooBig { max: usize, got: usize },
     #[error("Server error")]
     Custom {
         code: i32,
@@ -45,6 +51,9 @@ impl JsonError {
             Self::MethodNotFound => -32601,
             Self::InvalidParams => -32602,
             Self::InternalError => -32603,
+            Self::ConnectionFailed { .. } => -32604,
+            Self::HttpError { .. } => -32605,
+            Self::RequestBodyTooBig { .. } => -32606,
             Self::Custom { code, .. } => *code,
         }
     }
@@ -57,16 +66,16 @@ impl JsonError {
     }
 }
 
-#[allow(unreachable_patterns)] // Currently there is only one variant in enum.
 impl From<RpcError> for JsonError {
     fn from(err: RpcError) -> Self {
-        match err {
-            RpcError::Server(error) => error,
-            _ => JsonError::Custom {
+        if let RpcError::Server(error) = err {
+            error
+        } else {
+            JsonError::Custom {
                 code: -32000,
                 message: "RPC error".to_string(),
                 data: Some(serde_json::to_value(err).unwrap()),
-            },
+            }
         }
     }
 }

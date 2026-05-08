@@ -49,7 +49,7 @@ use crate::protocol::consensus::transaction::TransactionKernelProxy;
 use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+use crate::protocol::proof_abstractions::tasm::program::TritonProgram;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::protocol::proof_abstractions::SecretWitness;
@@ -67,7 +67,7 @@ pub struct MergeWitness {
     pub(crate) right_kernel: TransactionKernel,
 
     // This field, exceptionally, *CAN* contain packed `RemovalRecord`s.
-    pub(crate) new_kernel: TransactionKernel,
+    pub new_kernel: TransactionKernel,
     pub(crate) left_proof: Proof,
     pub(crate) right_proof: Proof,
 }
@@ -108,7 +108,7 @@ impl MergeWitness {
     /// Generate a `MergeWitness` from two transactions (kernels plus proofs).
     /// Assumes the transactions can be merged. Takes randomness for shuffling
     /// the concatenations of inputs, outputs, and announcements.
-    pub(crate) fn from_transactions(
+    pub fn from_transactions(
         left: Transaction,
         right: Transaction,
         shuffle_seed: [u8; 32],
@@ -148,23 +148,27 @@ impl MergeWitness {
     ) -> Result<Transaction> {
         let new_kernel = self.new_kernel.clone();
 
-        let new_single_proof_witness = SingleProofWitness::from_merge(self);
-        let new_single_proof_claim = new_single_proof_witness.claim();
-        info!("Start: creating new single proof through merge");
-        let new_single_proof = SingleProof
-            .prove(
-                new_single_proof_claim,
-                new_single_proof_witness.nondeterminism(),
-                triton_vm_job_queue,
-                proof_job_options,
-            )
-            .await?;
+        let proof = if proof_job_options.job_settings.network.use_mock_proof() {
+            Proof::valid_mock()
+        } else {
+            let new_single_proof_witness = SingleProofWitness::from_merge(self);
+            let new_single_proof_claim = new_single_proof_witness.claim();
+            info!("Start: creating new single proof through merge");
+            SingleProof
+                .prove(
+                    new_single_proof_claim,
+                    new_single_proof_witness.nondeterminism(),
+                    triton_vm_job_queue,
+                    proof_job_options,
+                )
+                .await?
+        };
 
         info!("Done: creating new single proof through merge");
 
         Ok(Transaction {
             kernel: new_kernel,
-            proof: TransactionProof::SingleProof(new_single_proof),
+            proof: TransactionProof::SingleProof(proof),
         })
     }
 
@@ -323,7 +327,7 @@ impl MergeBranch {
 }
 
 impl BasicSnippet for MergeBranch {
-    fn inputs(&self) -> Vec<(DataType, String)> {
+    fn parameters(&self) -> Vec<(DataType, String)> {
         vec![
             (DataType::Digest, "single_proof_program_digest".to_owned()),
             (DataType::Digest, "new_tx_kernel_digest".to_owned()),
@@ -332,7 +336,7 @@ impl BasicSnippet for MergeBranch {
         ]
     }
 
-    fn outputs(&self) -> Vec<(DataType, String)> {
+    fn return_values(&self) -> Vec<(DataType, String)> {
         vec![
             (DataType::Digest, "single_proof_program_digest".to_owned()),
             (DataType::Digest, "new_tx_kernel_digest".to_owned()),

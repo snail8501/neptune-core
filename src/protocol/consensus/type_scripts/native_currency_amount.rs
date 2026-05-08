@@ -27,7 +27,7 @@ use tasm_lib::twenty_first::math::bfield_codec::BFieldCodec;
 
 use super::native_currency::NativeCurrency;
 use crate::protocol::consensus::transaction::utxo::Coin;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+use crate::protocol::proof_abstractions::tasm::program::TritonProgram;
 use crate::triton_vm::prelude::triton_instr;
 
 /// Records an amount of Neptune coins. Amounts are internally represented by an
@@ -70,6 +70,7 @@ impl TasmObject for NativeCurrencyAmount {
 }
 
 impl NativeCurrencyAmount {
+    /// Maximum number of nau that is still a valid amount.
     pub(crate) const MAX_NAU: i128 = 42_000_000 * Self::conversion_factor();
 
     /// The maximum amount that is still valid.
@@ -80,6 +81,10 @@ impl NativeCurrencyAmount {
     /// The minimum amount that is still valid.
     pub(crate) fn min() -> Self {
         Self(-Self::MAX_NAU)
+    }
+
+    pub const fn coin_as_nau() -> i128 {
+        Self::conversion_factor()
     }
 
     /// The conversion factor is 10^30 * 2^2.
@@ -174,13 +179,13 @@ impl NativeCurrencyAmount {
     ///
     /// Quantities whose unit is nau are used for internal logic and are not to
     /// be used for user-facing displays.
-    pub fn to_nau(&self) -> i128 {
+    pub const fn to_nau(&self) -> i128 {
         self.0
     }
 
     /// Convert the number of Neptune atomic units (nau) to a
     /// `NativeCurrencyAmount`.
-    pub fn from_nau(nau: i128) -> Self {
+    pub const fn from_nau(nau: i128) -> Self {
         Self(nau)
     }
 
@@ -586,11 +591,11 @@ pub mod neptune_arbitrary {
     }
 }
 
-#[cfg(feature = "mock-rpc")]
+#[cfg(any(feature = "mock-rpc", test))]
 impl rand::distr::Distribution<NativeCurrencyAmount> for rand::distr::StandardUniform {
     fn sample<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> NativeCurrencyAmount {
         NativeCurrencyAmount::from_nau(
-            rng.random_range(-NativeCurrencyAmount::MAX_NAU..NativeCurrencyAmount::MAX_NAU),
+            rng.random_range(NativeCurrencyAmount::min().0..NativeCurrencyAmount::max().0),
         )
     }
 }

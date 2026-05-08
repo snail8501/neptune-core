@@ -9,6 +9,11 @@ use serde::Serialize;
 use tasm_lib::prelude::TasmObject;
 use tasm_lib::triton_vm::prelude::BFieldCodec;
 use tasm_lib::triton_vm::prelude::BFieldElement;
+use tracing::debug;
+
+use crate::api::export::UnlockedUtxo;
+use crate::protocol::consensus::block::pow::LustrationStatus;
+use crate::protocol::consensus::transaction::transaction_kernel::LUSTRATION_FLAG;
 
 /// Represents arbitrary data that can be stored in a transaction on the public
 /// blockchain.
@@ -38,6 +43,46 @@ pub struct Announcement {
 impl Announcement {
     pub fn new(message: Vec<BFieldElement>) -> Self {
         Self { message }
+    }
+
+    /// Returns true iff the announcement carries the lustration flag.
+    ///
+    /// Does not attempt to check if the lustration can be decoded. Just checks
+    /// for the flag, so if the announcement is not generated locally, this
+    /// method cannot be trusted to correctly identify lustration announcements
+    /// which would be meaningless anyway without the context of the whole
+    /// transaction kernel.
+    pub fn looks_like_lustration(&self) -> bool {
+        self.message
+            .first()
+            .is_some_and(|elem0| *elem0 == LUSTRATION_FLAG)
+    }
+
+    pub fn lustration_announcements(
+        lustration_status: LustrationStatus,
+        tx_inputs: &[UnlockedUtxo],
+    ) -> Vec<Self> {
+        let mut lustrations = vec![];
+
+        for input in tx_inputs {
+            // Match consensus rule that defines when inputs need to be
+            // lustrated.
+            let (input_index_lower_end, _) = input
+                .absolute_indices()
+                .aocl_range()
+                .expect("Must be able to calculate AOCL range of own input");
+
+            if input_index_lower_end <= lustration_status.max_lustrating_aocl_leaf_index {
+                debug!(
+                    "Found input in need of lustration. Lustrating now. Input index min
+                     range was: {input_index_lower_end}"
+                );
+                // Input must be lustrated
+                lustrations.push(input.lustration());
+            }
+        }
+
+        lustrations
     }
 }
 
@@ -99,6 +144,15 @@ impl TryFrom<String> for Announcement {
         }
 
         Ok(Self { message: bfes })
+    }
+}
+
+#[cfg(test)]
+impl rand::distr::Distribution<Announcement> for rand::distr::StandardUniform {
+    fn sample<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> Announcement {
+        Announcement {
+            message: (0..10).map(|_| rng.random()).collect_vec(),
+        }
     }
 }
 

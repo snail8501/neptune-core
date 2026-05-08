@@ -54,19 +54,22 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::anyhow;
 use anyhow::Result;
 use get_size2::GetSize;
 use itertools::Itertools;
+use libp2p::multiaddr::Protocol;
+use libp2p::Multiaddr;
 use num_traits::Zero;
 use serde::Deserialize;
 use serde::Serialize;
 use systemstat::Platform;
 use systemstat::System;
 use tarpc::context;
-use tasm_lib::twenty_first::prelude::Mmr;
+use tasm_lib::prelude::Tip5;
 use tasm_lib::twenty_first::tip5::digest::Digest;
+use tokio::sync::oneshot;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -74,15 +77,17 @@ use tracing::warn;
 
 use super::auth;
 use crate::api;
+use crate::api::export::AnnouncementFlag;
+use crate::api::export::ConsolidationError;
 use crate::api::tx_initiation;
-use crate::api::tx_initiation::builder::tx_input_list_builder::InputSelectionPolicy;
+use crate::api::tx_initiation::builder::input_selector::InputSelectionPolicy;
 use crate::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
 use crate::application::config::network::Network;
 use crate::application::database::storage::storage_vec::traits::StorageVecBase;
-use crate::application::loops::channel::ClaimUtxoData;
 use crate::application::loops::channel::RPCServerToMain;
 use crate::application::loops::main_loop::proof_upgrader::UpgradeJob;
 use crate::application::loops::mine_loop::coinbase_distribution::CoinbaseDistribution;
+use crate::application::network::overview::NetworkOverview;
 use crate::application::rpc::server::coinbase_output_readable::CoinbaseOutputReadable;
 use crate::application::rpc::server::error::RpcError;
 use crate::application::rpc::server::mempool_transaction_info::MempoolTransactionInfo;
@@ -100,6 +105,7 @@ use crate::protocol::consensus::block::block_kernel::BlockKernel;
 use crate::protocol::consensus::block::block_selector::BlockSelector;
 use crate::protocol::consensus::block::difficulty_control::Difficulty;
 use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::announcement::Announcement;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
@@ -110,33 +116,41 @@ use crate::protocol::peer::peer_info::PeerInfo;
 use crate::protocol::peer::InstanceId;
 use crate::protocol::peer::PeerStanding;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
+use crate::state::claim_error::ClaimError;
 use crate::state::mining::mining_state::MAX_NUM_EXPORTED_BLOCK_PROPOSAL_STORED;
 use crate::state::transaction::transaction_details::TransactionDetails;
 use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 use crate::state::transaction::tx_creation_artifacts::TxCreationArtifacts;
-use crate::state::wallet::address::encrypted_utxo_notification::EncryptedUtxoNotification;
 use crate::state::wallet::address::KeyType;
 use crate::state::wallet::address::ReceivingAddress;
 use crate::state::wallet::address::SpendingKey;
 use crate::state::wallet::change_policy::ChangePolicy;
 use crate::state::wallet::coin_with_possible_timelock::CoinWithPossibleTimeLock;
-use crate::state::wallet::expected_utxo::UtxoNotifier;
-use crate::state::wallet::incoming_utxo::IncomingUtxo;
-use crate::state::wallet::monitored_utxo::MonitoredUtxo;
-use crate::state::wallet::transaction_input::TxInputList;
+use crate::state::wallet::monitored_utxo::MonitoredUtxoSpentStatus;
 use crate::state::wallet::transaction_output::TxOutputList;
+use crate::state::wallet::unlocked_utxo::TxInputs;
 use crate::state::wallet::wallet_status::WalletStatus;
+use crate::state::wallet::MAX_DERIVATION_INDEX_BUMP;
 use crate::state::GlobalState;
 use crate::state::GlobalStateLock;
-use crate::twenty_first::prelude::Tip5;
 use crate::util_types::mutator_set::addition_record::AdditionRecord;
 use crate::util_types::mutator_set::archival_mutator_set::ResponseMsMembershipProofPrivacyPreserving;
+use crate::util_types::mutator_set::commit;
 use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
 use crate::DataDirectory;
 
 /// result returned by RPC methods
 pub type RpcResult<T> = Result<T, error::RpcError>;
 
+/// Tarpc generates enums `RPCRequest` and `RPCResponse` for each method
+/// declared in this trait. These enums are public and not marked
+/// `#[non_exhaustive]`. As a result, according to strict semantic versioning,
+/// adding new variants is a breaking change mandating a new major version.
+///
+/// We apply a relaxed rule set where adding new RPC endpoints is not considered
+/// a breaking change. Consequently, external users should note: if you match on
+/// `RPCRequest` or `RPCResponse`, make sure you match statement has a catch-all
+/// branch -- otherwise, minor version bumps might break your code.
 #[tarpc::service]
 pub trait RPC {
     /******** READ DATA ********/
@@ -531,6 +545,24 @@ pub trait RPC {
         token: auth::Token,
         block_selector: BlockSelector,
     ) -> RpcResult<Option<Vec<Announcement>>>;
+
+    /// Return the block heights of blocks with announcements matching the
+    /// specified flags. Returns the empty list if no blocks with these flags
+    /// are known.
+    ///
+    /// Only works on nodes that maintain a UTXO index.
+    ///
+    /// # Warning
+    ///
+    /// Will not return all block if any key in question has matching
+    /// [`AnnouncementFlag`]s in more than
+    /// [MAX_NUM_BLOCKS_IN_LOOKUP_LIST] blocks.
+    ///
+    /// [MAX_NUM_BLOCKS_IN_LOOKUP_LIST]: crate::state::archival_state::rusty_utxo_index::MAX_NUM_BLOCKS_IN_LOOKUP_LIST
+    async fn block_heights_by_announcement_flags(
+        token: auth::Token,
+        announcement_flags: Vec<AnnouncementFlag>,
+    ) -> RpcResult<Vec<BlockHeight>>;
 
     /// Return the digests of known blocks with specified height.
     ///
@@ -929,6 +961,16 @@ pub trait RPC {
         token: auth::Token,
         key_type: KeyType,
     ) -> RpcResult<ReceivingAddress>;
+
+    /// Get the current derivation index for keys of the given type.
+    async fn get_derivation_index(token: auth::Token, key_type: KeyType) -> RpcResult<u64>;
+
+    /// Set the current derivation index for keys of the given type.
+    async fn set_derivation_index(
+        token: auth::Token,
+        key_type: KeyType,
+        derivation_index: u64,
+    ) -> RpcResult<()>;
 
     /// Return all known keys, for every [KeyType]
     ///
@@ -1377,9 +1419,7 @@ pub trait RPC {
     ) -> RpcResult<Option<(Block, ProofOfWorkPuzzle)>>;
 
     /// todo: docs.
-    ///
-    /// meanwhile see [tx_initiation::initiator::TransactionInitiator::spendable_inputs()]
-    async fn spendable_inputs(token: auth::Token) -> RpcResult<TxInputList>;
+    async fn spendable_inputs(token: auth::Token) -> RpcResult<TxInputs>;
 
     /// retrieve spendable inputs sufficient to cover spend_amount by applying selection policy.
     ///
@@ -1392,13 +1432,11 @@ pub trait RPC {
     /// }
     ///
     /// todo: docs.
-    ///
-    /// meanwhile see [tx_initiation::initiator::TransactionInitiator::select_spendable_inputs()]
     async fn select_spendable_inputs(
         token: auth::Token,
         policy: InputSelectionPolicy,
         spend_amount: NativeCurrencyAmount,
-    ) -> RpcResult<TxInputList>;
+    ) -> RpcResult<TxInputs>;
 
     /// generate tx outputs from list of OutputFormat.
     ///
@@ -1420,7 +1458,7 @@ pub trait RPC {
     /// meanwhile see [tx_initiation::initiator::TransactionInitiator::generate_tx_details()]
     async fn generate_tx_details(
         token: auth::Token,
-        tx_inputs: TxInputList,
+        tx_inputs: TxInputs,
         tx_outputs: TxOutputList,
         change_policy: ChangePolicy,
         fee: NativeCurrencyAmount,
@@ -1463,6 +1501,16 @@ pub trait RPC {
         token: auth::Token,
         txid: TransactionKernelId,
     ) -> RpcResult<TransactionProofType>;
+
+    /// Validate all canonical, stored blocks within the specified range.
+    ///
+    /// Does not return the result, as this check may take a very long time.
+    /// To inspect the result of this verification, see the application's log.
+    async fn revalidate_history(
+        token: auth::Token,
+        first: BlockHeight,
+        last: BlockHeight,
+    ) -> RpcResult<()>;
 
     /******** BLOCKCHAIN STATISTICS ********/
     // Place all endpoints that relate to statistics of the blockchain here
@@ -1523,6 +1571,19 @@ pub trait RPC {
         max_num_blocks: Option<usize>,
     ) -> RpcResult<Vec<(u64, Difficulty)>>;
 
+    /// Upper bound on the total amount of coins spendable now, in particular,
+    /// without counting time-locked coins, but with accounting for the premine,
+    /// the redemptions, and known burns.
+    async fn circulating_supply(token: auth::Token) -> RpcResult<NativeCurrencyAmount>;
+
+    /// Asymptotical limit on the total amount of coins, counting all coins
+    /// already mined or to be mined in the future, disregarding all time-locks,
+    /// counting the premine and redemptions, and accounting for known burns.
+    async fn max_supply(token: auth::Token) -> RpcResult<NativeCurrencyAmount>;
+
+    /// Total amount of coins burned.
+    async fn burned_supply(token: auth::Token) -> RpcResult<NativeCurrencyAmount>;
+
     /******** PEER INTERACTIONS ********/
 
     /// Broadcast transaction notifications for all transactions in this node's
@@ -1535,7 +1596,10 @@ pub trait RPC {
     /******** CHANGE THINGS ********/
     // Place all things that change state here
 
-    /// Clears standing for all peers, connected or not
+    /// Clears standing for all peers, connected or not.
+    ///
+    /// Legacy command, applies at the peer loop logic level. For the modern
+    /// equivalent, see [`RPC::unban_all`].
     ///
     /// ```no_run
     /// # use anyhow::Result;
@@ -1568,7 +1632,10 @@ pub trait RPC {
     /// ```
     async fn clear_all_standings(token: auth::Token) -> RpcResult<()>;
 
-    /// Clears standing for ip, whether connected or not
+    /// Clears standing for ip, whether connected or not.
+    ///
+    /// Legacy command, applies at the peer loop logic level. For the modern
+    /// equivalent, see [`RPC::unban`].
     ///
     /// ```no_run
     /// # use anyhow::Result;
@@ -1605,6 +1672,35 @@ pub trait RPC {
     /// ```
     async fn clear_standing_by_ip(token: auth::Token, ip: IpAddr) -> RpcResult<()>;
 
+    /// Put the given address on the black list and disconnect if there is a
+    /// connection to this peer.
+    ///
+    /// Requires a connection to the server.
+    async fn ban(token: auth::Token, ip: Multiaddr) -> RpcResult<()>;
+
+    /// Remove the given address from black list and clear the corresponding
+    /// peer standing.
+    ///
+    /// Requires a connection to the server.
+    async fn unban(token: auth::Token, ip: Multiaddr) -> RpcResult<()>;
+
+    /// Remove all entries from the black list and clear all peer standings.
+    ///
+    /// Requires a connection to the server.
+    async fn unban_all(token: auth::Token) -> RpcResult<()>;
+
+    /// Dial (attempt to initiate a connection to) a [`Multiaddr`].
+    async fn dial(token: auth::Token, address: Multiaddr) -> RpcResult<()>;
+
+    /// Probe the NAT status of this node.
+    async fn probe_nat(token: auth::Token) -> RpcResult<()>;
+
+    /// Reset this node's relay reservations with its relaying peers.
+    async fn reset_relay_reservations(token: auth::Token) -> RpcResult<()>;
+
+    /// Get the network overview data and health statistics.
+    async fn get_network_overview(token: auth::Token) -> RpcResult<NetworkOverview>;
+
     /// record transaction and initiate broadcast to peers
     ///
     /// todo: docs.
@@ -1613,6 +1709,46 @@ pub trait RPC {
     async fn record_and_broadcast_transaction(
         token: auth::Token,
         tx_artifacts: TxCreationArtifacts,
+    ) -> RpcResult<()>;
+
+    /// Rescan the specified range of blocks for incoming UTXOS that were sent
+    /// with associated on-chain announements.
+    ///
+    /// Any found UTXOs are monitored going forward.
+    async fn rescan_announced(
+        token: auth::Token,
+        first: BlockHeight,
+        last: BlockHeight,
+        derivation_path: Option<(KeyType, u64)>,
+    ) -> RpcResult<()>;
+
+    /// Rescan the specified range of blocks for incoming UTXOS that have
+    /// been added as expected UTXOs to the node's wallet.
+    ///
+    /// Any found UTXOs are monitored going forward.
+    async fn rescan_expected(
+        token: auth::Token,
+        first: BlockHeight,
+        last: BlockHeight,
+    ) -> RpcResult<()>;
+
+    /// Rescan all monitored UTXOs for outgoing UTXOs, *i.e.*, UTXOs spent by
+    /// the node's wallet.
+    ///
+    /// Can be used to recreate a transaction history if a UTXO index is
+    /// maintained.
+    ///
+    /// Any found UTXOs are monitored going forward.
+    async fn rescan_outgoing(token: auth::Token) -> RpcResult<()>;
+
+    /// Rescan the specified range for blocks that were successfully guessed by
+    /// this node.
+    ///
+    /// Any found UTXOs are monitored going forward.
+    async fn rescan_guesser_rewards(
+        token: auth::Token,
+        first: BlockHeight,
+        last: BlockHeight,
     ) -> RpcResult<()>;
 
     /// Send coins to one or more recipients
@@ -1674,12 +1810,16 @@ pub trait RPC {
     /// // change policy.
     /// // default is recover to next unused key, via onchain notification
     /// let change_policy = ChangePolicy::default();
+    ///
+    /// // Whether or not to accept that the transaction generates lustrations,
+    /// // which reveals, publicly, the UTXOs of all inputs.
+    /// let accept_lustrations = false;
     /// #
     /// // Max fee
     /// let fee : NativeCurrencyAmount = NativeCurrencyAmount::coins(10);
     /// #
     /// // neptune-core server sends token to a single recipient
-    /// let send_result = client.send(context::current(), token, outputs, change_policy, fee).await??;
+    /// let send_result = client.send(context::current(), token, outputs, change_policy, fee, accept_lustrations).await??;
     /// # Ok(())
     /// # }
     /// ```
@@ -1688,6 +1828,7 @@ pub trait RPC {
         outputs: Vec<OutputFormat>,
         change_policy: ChangePolicy,
         fee: NativeCurrencyAmount,
+        accept_lustrations: bool,
     ) -> RpcResult<TxCreationArtifacts>;
 
     /// Like `send` but the resulting transaction is *transparent*. No privacy.
@@ -1703,6 +1844,24 @@ pub trait RPC {
         change_policy: ChangePolicy,
         fee: NativeCurrencyAmount,
     ) -> RpcResult<TxCreationArtifacts>;
+
+    /// Initiate a transaction that spends a batch of UTXOs to the node's own
+    /// wallet, reducing the total number of UTXOs under management.
+    ///
+    /// # Parameters
+    ///
+    ///  - `num_inputs` -- set to override the default (4) number of inputs to
+    ///    be consolidated.
+    ///  - `to_address` -- set to consolidate the UTXOs to the given address as
+    ///    opposed to the next symmetric address of the node's own wallet.
+    ///  - `accept_lustration` -- Whether or not it is acceptable to lustrate
+    ///    the inputs, i.e. reveal the input UTXOs used in the transaction.
+    async fn consolidate(
+        token: auth::Token,
+        num_inputs: Option<usize>,
+        to_address: Option<ReceivingAddress>,
+        accept_lustration: bool,
+    ) -> RpcResult<usize>;
 
     /// Upgrade a proof for a transaction found in the mempool. If the
     /// transaction cannot be in the mempool, or the transaction is not in need
@@ -1856,7 +2015,7 @@ pub trait RPC {
     async fn restart_miner(token: auth::Token) -> RpcResult<()>;
 
     /// Set coinbase distribution for this node's block proposals. This
-    /// distribution will be in effect until it is overwritted or manually
+    /// distribution will be in effect until it is overwritten or manually
     /// unset. The value set through this command stays in effect regardless of
     /// whether the block's proposals are mined or not. Only by overwriting this
     /// value by calling this function again, or by unsetting this value through
@@ -1920,7 +2079,8 @@ pub trait RPC {
         block_proposal: Block,
     ) -> RpcResult<bool>;
 
-    /// mark MUTXOs as abandoned
+    /// mark MUTXOs as abandoned. Does not actually delete any elements in the
+    /// list.
     ///
     /// ```no_run
     /// # use anyhow::Result;
@@ -2024,7 +2184,7 @@ impl NeptuneRPCServer {
     async fn confirmations_internal(&self, state: &GlobalState) -> Option<BlockHeight> {
         match state.get_latest_balance_height().await {
             Some(latest_balance_height) => {
-                let tip_block_header = state.chain.light_state().header();
+                let tip_block_header = state.chain.tip().header();
 
                 assert!(tip_block_header.height >= latest_balance_height);
 
@@ -2049,183 +2209,28 @@ impl NeptuneRPCServer {
         current_system.cpu_temp().ok()
     }
 
-    /// Assemble a data for the wallet to register the UTXO. Returns `Ok(None)`
-    /// if the UTXO has already been claimed by the wallet.
-    ///
-    /// `max_search_depth` denotes how many blocks back from tip we attempt
-    /// to find the transaction in a block. `None` means unlimited.
-    ///
-    /// `encrypted_utxo_notification` is expected to hold encrypted data about
-    /// a future or past UTXO, which can be claimed by this client.
-    async fn claim_utxo_inner(
-        &self,
-        encrypted_utxo_notification: String,
-        max_search_depth: Option<u64>,
-    ) -> Result<Option<ClaimUtxoData>, error::ClaimError> {
-        let span = tracing::debug_span!("Claim UTXO inner");
-        let _enter = span.enter();
-
-        // deserialize UtxoTransferEncrypted from bech32m string.
-        let network = self.state.cli().network;
-        let utxo_transfer_encrypted =
-            EncryptedUtxoNotification::from_bech32m(&encrypted_utxo_notification, network)?;
-
-        // // acquire global state read lock
-        let state = self.state.lock_guard().await;
-
-        // find known spending key by receiver_identifier
-        let spending_key = state
-            .wallet_state
-            .find_known_spending_key_for_receiver_identifier(
-                utxo_transfer_encrypted.receiver_identifier,
-            )
-            .ok_or(error::ClaimError::UtxoUnknown)?;
-
-        // decrypt utxo_transfer_encrypted into UtxoTransfer
-        let utxo_notification = utxo_transfer_encrypted.decrypt_with_spending_key(&spending_key)?;
-
-        tracing::debug!("claim-utxo: decrypted {:#?}", utxo_notification);
-
-        // search for matching monitored utxo and return early if found.
-        if state
-            .wallet_state
-            .find_monitored_utxo(&utxo_notification.utxo, utxo_notification.sender_randomness)
-            .await
-            .is_some()
-        {
-            info!("found monitored utxo. Returning early.");
-            return Ok(None);
-        }
-
-        // construct an IncomingUtxo
-        let incoming_utxo = IncomingUtxo::from_utxo_notification_payload(
-            utxo_notification,
-            spending_key.privacy_preimage(),
-        );
-
-        // Check if we can satisfy typescripts
-        if !incoming_utxo.utxo.all_type_script_states_are_valid() {
-            let err = error::ClaimError::InvalidTypeScript;
-            warn!("{}", err.to_string());
-            return Err(err);
-        }
-
-        // check if wallet is already expecting this utxo.
-        let addition_record = incoming_utxo.addition_record();
-        let has_expected_utxo = state.wallet_state.has_expected_utxo(addition_record).await;
-
-        // Check if UTXO has already been mined in a transaction.
-        let mined_in_block = state
-            .chain
-            .archival_state()
-            .find_canonical_block_with_output(addition_record, max_search_depth)
-            .await;
-        let maybe_prepared_mutxo = match mined_in_block {
-            Some(block) => {
-                let aocl_leaf_index = {
-                    // Find matching AOCL leaf index that must be in this block
-                    let last_aocl_index_in_block = block
-                        .mutator_set_accumulator_after()
-                        .expect("Block from state must have mutator set after")
-                        .aocl
-                        .num_leafs()
-                        - 1;
-                    let num_outputs_in_block: u64 = block
-                        .mutator_set_update()
-                        .expect("Block from state must have mutator set update")
-                        .additions
-                        .len()
-                        .try_into()
-                        .unwrap();
-                    let min_aocl_leaf_index = last_aocl_index_in_block - num_outputs_in_block + 1;
-                    let mut haystack = last_aocl_index_in_block;
-                    let ams = state.chain.archival_state().archival_mutator_set.ams();
-                    while ams.aocl.get_leaf_async(haystack).await
-                        != addition_record.canonical_commitment
-                    {
-                        assert!(haystack > min_aocl_leaf_index);
-                        haystack -= 1;
-                    }
-
-                    haystack
-                };
-                let item = Tip5::hash(&incoming_utxo.utxo);
-                let ams = state.chain.archival_state().archival_mutator_set.ams();
-                let msmp = ams
-                    .restore_membership_proof(
-                        item,
-                        incoming_utxo.sender_randomness,
-                        incoming_utxo.receiver_preimage,
-                        aocl_leaf_index,
-                    )
-                    .await
-                    .map_err(|x| anyhow!("Could not restore mutator set membership proof. Is archival mutator set corrupted? Got error: {x}"))?;
-
-                let tip_digest = state.chain.light_state().hash();
-
-                let mut monitored_utxo = MonitoredUtxo::new(
-                    incoming_utxo.utxo.clone(),
-                    self.state.cli().number_of_mps_per_utxo,
-                );
-                monitored_utxo.confirmed_in_block = Some((
-                    block.hash(),
-                    block.header().timestamp,
-                    block.header().height,
-                ));
-                monitored_utxo.add_membership_proof_for_tip(tip_digest, msmp.clone());
-
-                // Was UTXO already spent? If so, register it as such.
-                let msa = ams.accumulator().await;
-                if !msa.verify(item, &msmp) {
-                    warn!("Claimed UTXO was already spent. Marking it as such.");
-
-                    if let Some(spending_block) = state
-                        .chain
-                        .archival_state()
-                        .find_canonical_block_with_input(
-                            msmp.compute_indices(item),
-                            max_search_depth,
-                        )
-                        .await
-                    {
-                        warn!(
-                            "Claimed UTXO was spent in block {:x}; which has height {}",
-                            spending_block.hash(),
-                            spending_block.header().height
-                        );
-                        monitored_utxo.mark_as_spent(&spending_block);
-                    } else {
-                        error!("Claimed UTXO's mutator set membership proof was invalid but we could not find the block in which it was spent. This is most likely a bug in the software.");
-                    }
-                }
-
-                Some(monitored_utxo)
-            }
-            None => None,
-        };
-
-        let expected_utxo = incoming_utxo.into_expected_utxo(UtxoNotifier::Cli);
-        Ok(Some(ClaimUtxoData {
-            prepared_monitored_utxo: maybe_prepared_mutxo,
-            has_expected_utxo,
-            expected_utxo,
-        }))
-    }
-
     /// Return a PoW puzzle with the provided guesser address.
     async fn pow_puzzle_inner(
         mut self,
         guesser_address: ReceivingAddress,
         mut proposal: Block,
     ) -> RpcResult<Option<ProofOfWorkPuzzle>> {
-        let latest_block_header = *self.state.lock_guard().await.chain.light_state().header();
+        let network = self.state.cli().network;
+
+        let mut state = self.state.lock_guard_mut().await;
+        let next_rules = ConsensusRuleSet::infer_from(network, proposal.header().height);
+        let difficulty = if next_rules.use_parent_difficulty() {
+            let latest_block_header = *state.chain.tip().header();
+            latest_block_header.difficulty
+        } else {
+            proposal.header().difficulty
+        };
 
         proposal.set_header_guesser_address(guesser_address);
-        let puzzle = ProofOfWorkPuzzle::new(proposal.clone(), latest_block_header.difficulty);
+        let puzzle = ProofOfWorkPuzzle::new(proposal.clone(), difficulty);
 
         // Record block proposal in case of guesser-success, for later
         // retrieval. But limit number of blocks stored this way.
-        let mut state = self.state.lock_guard_mut().await;
         if state.mining_state.exported_block_proposals.len()
             >= MAX_NUM_EXPORTED_BLOCK_PROPOSAL_STORED
         {
@@ -2241,13 +2246,15 @@ impl NeptuneRPCServer {
     }
 
     /// Verify a pow solution and send it to main loop if it is valid.
-    async fn pow_solution_inner(&self, mut proposal: Block, pow: BlockPow) -> RpcResult<bool> {
-        // Check if solution works.
-        let latest_block_header = *self.state.lock_guard().await.chain.light_state().header();
-
+    async fn pow_solution_inner(
+        &self,
+        mut proposal: Block,
+        pow: BlockPow,
+        tip_header: BlockHeader,
+    ) -> RpcResult<bool> {
         proposal.set_header_pow(pow);
 
-        if !proposal.has_proof_of_work(self.state.cli().network, &latest_block_header) {
+        if !proposal.has_proof_of_work(self.state.cli().network, &tip_header) {
             warn!("Got claimed PoW solution but PoW solution is not valid.");
             return Ok(false);
         }
@@ -2265,6 +2272,28 @@ impl NeptuneRPCServer {
     /// get the data_directory for this neptune-core instance
     pub fn data_directory(&self) -> &DataDirectory {
         &self.data_directory
+    }
+
+    async fn get_network_overview_inner(&self) -> RpcResult<NetworkOverview> {
+        // Create one-shot channel.
+        let (tx, rx) = oneshot::channel();
+
+        // Send one-shot channel to NetworkActor, via main loop.
+        self.rpc_server_to_main_tx
+            .send(RPCServerToMain::GetNetworkOverview(tx))
+            .await
+            .map_err(|e| {
+                RpcError::SendError(format!("could not send message to main loop: {e}"))
+            })?;
+
+        // Await receipt.
+        match tokio::time::timeout(Duration::from_secs(2), rx).await {
+            Ok(Ok(overview)) => Ok(overview),
+            Ok(Err(e)) => Err(RpcError::SendError(format!("NetworkActor dropped: {e}."))),
+            Err(e) => Err(RpcError::Failed(format!(
+                "RPC Timeout while waiting for NetworkActor response: {e}."
+            ))),
+        }
     }
 }
 
@@ -2321,15 +2350,7 @@ impl RPC for NeptuneRPCServer {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
-        Ok(self
-            .state
-            .lock_guard()
-            .await
-            .chain
-            .light_state()
-            .kernel
-            .header
-            .height)
+        Ok(self.state.lock_guard().await.chain.tip_height())
     }
 
     async fn best_proposal(
@@ -2341,7 +2362,7 @@ impl RPC for NeptuneRPCServer {
         token.auth(&self.valid_tokens)?;
 
         let state = self.state.lock_guard().await;
-        let tip_digest = state.chain.light_state().hash();
+        let tip_digest = state.chain.tip_hash();
         let proposal = &state.mining_state.block_proposal;
 
         // Returning BlockInfo here is not completely kosher since a few fields
@@ -2382,7 +2403,7 @@ impl RPC for NeptuneRPCServer {
 
         let state = self.state.lock_guard().await;
 
-        let current_counter = state.wallet_state.spending_key_counter(key_type);
+        let current_counter = state.wallet_state.key_counter(key_type);
         let index = current_counter.checked_sub(1);
         let Some(index) = index else {
             return Err(RpcError::WalletKeyCounterIsZero);
@@ -2472,7 +2493,7 @@ impl RPC for NeptuneRPCServer {
         let Some(digest) = block_selector.as_digest(&state).await else {
             return Ok(None);
         };
-        let tip_digest = state.chain.light_state().hash();
+        let tip_digest = state.chain.tip_hash();
         let archival_state = state.chain.archival_state();
 
         let Some(block) = archival_state.get_block(digest).await.unwrap() else {
@@ -2587,12 +2608,9 @@ impl RPC for NeptuneRPCServer {
                 .join(", ")
         );
 
-        let cur_block = state.chain.light_state();
-        let tip_height = cur_block.header().height;
-        let tip_hash = cur_block.hash();
-        let tip_mutator_set = cur_block
-            .mutator_set_accumulator_after()
-            .expect("Tip must have valid MSA after");
+        let tip_height = state.chain.tip_height();
+        let tip_hash = state.chain.tip_hash();
+        let tip_mutator_set = state.chain.tip_mutator_set_after();
 
         Ok(ResponseMsMembershipProofPrivacyPreserving {
             tip_height,
@@ -2622,6 +2640,36 @@ impl RPC for NeptuneRPCServer {
         };
 
         Ok(Some(block.body().transaction_kernel.announcements.clone()))
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn block_heights_by_announcement_flags(
+        self,
+        _context: tarpc::context::Context,
+        token: auth::Token,
+        announcement_flags: Vec<AnnouncementFlag>,
+    ) -> RpcResult<Vec<BlockHeight>> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        if !self.state.cli().utxo_index {
+            return Err(RpcError::UtxoIndexNotPresent);
+        }
+
+        let announcement_flags: HashSet<_> = announcement_flags.into_iter().collect();
+        let blocks = self
+            .state
+            .lock_guard()
+            .await
+            .chain
+            .archival_state()
+            .utxo_index
+            .as_ref()
+            .expect("UTXO index must be present when set in CLI arguments")
+            .blocks_by_announcement_flags(&announcement_flags)
+            .await;
+
+        Ok(blocks.into_iter().collect())
     }
 
     // documented in trait. do not add doc-comment.
@@ -2656,7 +2704,7 @@ impl RPC for NeptuneRPCServer {
 
         let state = self.state.lock_guard().await;
 
-        let latest_block_digest = state.chain.light_state().hash();
+        let latest_block_digest = state.chain.tip().hash();
 
         Ok(state
             .chain
@@ -2695,9 +2743,19 @@ impl RPC for NeptuneRPCServer {
         let global_state = self.state.lock_guard().await;
 
         // Get all connected peers
-        for (socket_address, peer_info) in &global_state.net.peer_map {
+        for peer_info in global_state.net.peer_map.values() {
             if peer_info.standing().is_negative() {
-                sanctions_in_memory.insert(socket_address.ip(), peer_info.standing());
+                let maybe_ip = peer_info
+                    .address()
+                    .iter()
+                    .find_map(|component| match component {
+                        Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+                        Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+                        _ => None,
+                    });
+                if let Some(ip) = maybe_ip {
+                    sanctions_in_memory.insert(ip, peer_info.standing());
+                }
             }
         }
 
@@ -2764,8 +2822,10 @@ impl RPC for NeptuneRPCServer {
 
         let gs = self.state.lock_guard().await;
         let wallet_status = gs.get_wallet_status_for_tip().await;
+        let block_height = gs.chain.tip().header().height;
 
-        let confirmed_available = wallet_status.available_confirmed(Timestamp::now());
+        let confirmed_available =
+            wallet_status.confirmed_available_balance(block_height, Timestamp::now());
 
         // test inequality
         Ok(amount <= confirmed_available)
@@ -2782,8 +2842,10 @@ impl RPC for NeptuneRPCServer {
 
         let gs = self.state.lock_guard().await;
         let wallet_status = gs.get_wallet_status_for_tip().await;
+        let block_height = gs.chain.tip().header().height;
 
-        let confirmed_available = wallet_status.available_confirmed(Timestamp::now());
+        let confirmed_available =
+            wallet_status.confirmed_available_balance(block_height, Timestamp::now());
 
         Ok(confirmed_available)
     }
@@ -2800,9 +2862,7 @@ impl RPC for NeptuneRPCServer {
         let gs = self.state.lock_guard().await;
         let wallet_status = gs.get_wallet_status_for_tip().await;
 
-        Ok(gs
-            .wallet_state
-            .unconfirmed_available_balance(&wallet_status, Timestamp::now()))
+        Ok(wallet_status.unconfirmed_available_balance(Timestamp::now()))
     }
 
     // documented in trait. do not add doc-comment.
@@ -2876,6 +2936,69 @@ impl RPC for NeptuneRPCServer {
             .wallet_mut()
             .next_receiving_address(key_type)
             .await?)
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn get_derivation_index(
+        self,
+        _context: tarpc::context::Context,
+        token: auth::Token,
+        key_type: KeyType,
+    ) -> RpcResult<u64> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let counter = match key_type {
+            KeyType::Generation => self
+                .state
+                .lock_guard()
+                .await
+                .wallet_state
+                .wallet_db
+                .get_generation_key_counter(),
+            KeyType::Symmetric => self
+                .state
+                .lock_guard()
+                .await
+                .wallet_state
+                .wallet_db
+                .get_symmetric_key_counter(),
+        };
+
+        let derivation_index = counter
+            .checked_sub(1)
+            .ok_or(RpcError::WalletKeyCounterIsZero)?;
+
+        Ok(derivation_index)
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn set_derivation_index(
+        mut self,
+        _context: tarpc::context::Context,
+        token: auth::Token,
+        key_type: KeyType,
+        derivation_index: u64,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let wallet_state = &mut self.state.lock_guard_mut().await.wallet_state;
+        let current = wallet_state.key_counter(key_type);
+        let max = current + MAX_DERIVATION_INDEX_BUMP;
+
+        if current > derivation_index {
+            return Err(RpcError::InvalidDerivationIndexRange(current, max));
+        }
+        if derivation_index > max {
+            return Err(RpcError::InvalidDerivationIndexRange(current, max));
+        }
+
+        wallet_state
+            .bump_derivation_index(key_type, derivation_index)
+            .await;
+
+        Ok(())
     }
 
     // documented in trait. do not add doc-comment.
@@ -2990,14 +3113,19 @@ impl RPC for NeptuneRPCServer {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
+        // Assemble data.
         let now = Timestamp::now();
         let state = self.state.lock_guard().await;
         let tip_digest = {
             log_slow_scope!(fn_name!() + "::hash() tip digest");
-            state.chain.light_state().hash()
+            state.chain.tip_hash()
         };
-        let tip_header = *state.chain.light_state().header();
-        let syncing = state.net.sync_anchor.is_some();
+        let tip_header = *state.chain.tip().header();
+        let tip_time_to_mine = {
+            log_slow_scope!(fn_name!() + "::chain().light_state().time_to_mine()");
+            state.chain.light_state().time_to_mine()
+        };
+        let syncing = state.net.sync_status;
         let mempool_size = {
             log_slow_scope!(fn_name!() + "::mempool.get_size()");
             state.mempool.get_size()
@@ -3013,8 +3141,8 @@ impl RPC for NeptuneRPCServer {
         let cpu_temp = None; // disable for now.  call is too slow.
         let proving_capability = self.state.cli().proving_capability();
 
-        let peer_count = Some(state.net.peer_map.len());
-        let max_num_peers = self.state.cli().max_num_peers;
+        let peer_count = state.net.peer_map.len();
+        let network_overview = self.get_network_overview_inner().await.ok();
 
         let mining_status = Some(state.mining_state.mining_status);
 
@@ -3027,39 +3155,40 @@ impl RPC for NeptuneRPCServer {
             log_slow_scope!(fn_name!() + "::get_wallet_status_for_tip()");
             state.get_wallet_status_for_tip().await
         };
-        let wallet_state = &state.wallet_state;
 
+        let block_height = state.chain.tip().header().height;
         let confirmed_available_balance = {
             log_slow_scope!(fn_name!() + "::confirmed_available_balance()");
-            wallet_status.available_confirmed(now)
+            wallet_status.confirmed_available_balance(block_height, now)
         };
         let confirmed_total_balance = {
             log_slow_scope!(fn_name!() + "::confirmed_total_balance()");
-            wallet_status.total_confirmed()
+            wallet_status.confirmed_total_balance(block_height)
         };
 
         let unconfirmed_available_balance = {
             log_slow_scope!(fn_name!() + "::unconfirmed_available_balance()");
-            wallet_state.unconfirmed_available_balance(&wallet_status, now)
+            wallet_status.unconfirmed_available_balance(now)
         };
         let unconfirmed_total_balance = {
             log_slow_scope!(fn_name!() + "::unconfirmed_total_balance()");
-            wallet_state.unconfirmed_total_balance(&wallet_status)
+            wallet_status.unconfirmed_total_balance()
         };
 
         Ok(OverviewData {
             tip_digest,
             tip_header,
-            syncing,
+            tip_time_to_mine,
+            sync_status: syncing,
             confirmed_available_balance,
             confirmed_total_balance,
             unconfirmed_available_balance,
             unconfirmed_total_balance,
+            peer_count,
+            network_overview,
             mempool_size,
             mempool_total_tx_count,
             mempool_own_tx_count,
-            peer_count,
-            max_num_peers,
             mining_status,
             proving_capability,
             confirmations,
@@ -3113,16 +3242,138 @@ impl RPC for NeptuneRPCServer {
             .net
             .peer_map
             .iter_mut()
-            .for_each(|(socketaddr, peerinfo)| {
-                if socketaddr.ip() == ip {
+            .for_each(|(_peer_id, peerinfo)| {
+                let maybe_ip = peerinfo
+                    .address()
+                    .iter()
+                    .find_map(|component| match component {
+                        libp2p::multiaddr::Protocol::Ip4(ipv4_addr) => Some(IpAddr::V4(ipv4_addr)),
+                        libp2p::multiaddr::Protocol::Ip6(ipv6_addr) => Some(IpAddr::V6(ipv6_addr)),
+                        _ => None,
+                    });
+                if maybe_ip.is_some_and(|peer_ip| ip == peer_ip) {
                     peerinfo.standing.clear_standing();
                 }
             });
 
-        //Also clears this IP's standing in database, whether it is connected or not.
+        // Also clears this IP's standing in database, whether it is connected or not.
         global_state_mut.net.clear_ip_standing_in_database(ip).await;
 
         Ok(global_state_mut.flush_databases().await?)
+    }
+
+    // Already documented in trait; do not add docstring.
+    async fn ban(
+        self,
+        _: context::Context,
+        token: auth::Token,
+        address: Multiaddr,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        self.rpc_server_to_main_tx
+            .try_send(RPCServerToMain::Ban(address))
+            .map_err(|e| {
+                RpcError::SendError(format!("could not send message to main loop: {e}"))
+            })?;
+
+        Ok(())
+    }
+
+    // Already documented in trait; do not add docstring.
+    async fn unban(
+        self,
+        _: context::Context,
+        token: auth::Token,
+        address: Multiaddr,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        self.rpc_server_to_main_tx
+            .try_send(RPCServerToMain::Unban(address))
+            .map_err(|e| {
+                RpcError::SendError(format!("could not send message to main loop: {e}"))
+            })?;
+
+        Ok(())
+    }
+
+    // Already documented in trait; do not add docstring.
+    async fn unban_all(self, _: context::Context, token: auth::Token) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        self.rpc_server_to_main_tx
+            .try_send(RPCServerToMain::UnbanAll)
+            .map_err(|e| {
+                RpcError::SendError(format!("could not send message to main loop: {e}"))
+            })?;
+
+        Ok(())
+    }
+
+    // Already documented in trait; do not add docstring.
+    async fn dial(
+        self,
+        _: context::Context,
+        token: auth::Token,
+        address: Multiaddr,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        self.rpc_server_to_main_tx
+            .try_send(RPCServerToMain::Dial(address))
+            .map_err(|e| {
+                RpcError::SendError(format!("could not send message to main loop: {e}"))
+            })?;
+
+        Ok(())
+    }
+
+    // Already documented in trait; do not add docstring.
+    async fn probe_nat(self, _: context::Context, token: auth::Token) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        self.rpc_server_to_main_tx
+            .try_send(RPCServerToMain::ProbeNat)
+            .map_err(|e| {
+                RpcError::SendError(format!("could not send message to main loop: {e}"))
+            })?;
+
+        Ok(())
+    }
+
+    // Already documented in trait; do not add docstring.
+    async fn reset_relay_reservations(
+        self,
+        _: context::Context,
+        token: auth::Token,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        self.rpc_server_to_main_tx
+            .try_send(RPCServerToMain::ResetRelayReservations)
+            .map_err(|e| {
+                RpcError::SendError(format!("could not send message to main loop: {e}"))
+            })?;
+
+        Ok(())
+    }
+    // Already documented in trait; do not add docstring.
+    async fn get_network_overview(
+        self,
+        _: context::Context,
+        token: auth::Token,
+    ) -> RpcResult<NetworkOverview> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        self.get_network_overview_inner().await
     }
 
     // documented in trait. do not add doc-comment.
@@ -3144,6 +3395,105 @@ impl RPC for NeptuneRPCServer {
     }
 
     // documented in trait. do not add doc-comment.
+    async fn rescan_announced(
+        self,
+        _: context::Context,
+        token: auth::Token,
+        first: BlockHeight,
+        last: BlockHeight,
+        derivation_path: Option<(KeyType, u64)>,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        if first > last {
+            return Err(RpcError::BlockRangeError);
+        }
+
+        let keys = if let Some((key_type, derivation_index)) = derivation_path {
+            vec![self
+                .state
+                .lock_guard()
+                .await
+                .wallet_state
+                .nth_spending_key(key_type, derivation_index)]
+        } else {
+            self.state
+                .lock_guard()
+                .await
+                .wallet_state
+                .get_all_known_spending_keys()
+                .collect_vec()
+        };
+
+        let _ = self
+            .rpc_server_to_main_tx
+            .send(RPCServerToMain::RescanAnnounced { first, last, keys })
+            .await;
+
+        Ok(())
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn rescan_expected(
+        self,
+        _: context::Context,
+        token: auth::Token,
+        first: BlockHeight,
+        last: BlockHeight,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        if first > last {
+            return Err(RpcError::BlockRangeError);
+        }
+
+        let _ = self
+            .rpc_server_to_main_tx
+            .send(RPCServerToMain::RescanExpected { first, last })
+            .await;
+
+        Ok(())
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn rescan_outgoing(self, _: context::Context, token: auth::Token) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let _ = self
+            .rpc_server_to_main_tx
+            .send(RPCServerToMain::RescanOutgoing {})
+            .await;
+
+        Ok(())
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn rescan_guesser_rewards(
+        self,
+        _: context::Context,
+        token: auth::Token,
+        first: BlockHeight,
+        last: BlockHeight,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        if first > last {
+            return Err(RpcError::BlockRangeError);
+        }
+
+        let _ = self
+            .rpc_server_to_main_tx
+            .send(RPCServerToMain::RescanGuesserRewards { first, last })
+            .await;
+
+        Ok(())
+    }
+
+    // documented in trait. do not add doc-comment.
     async fn send(
         mut self,
         _ctx: context::Context,
@@ -3151,6 +3501,7 @@ impl RPC for NeptuneRPCServer {
         outputs: Vec<OutputFormat>,
         change_policy: ChangePolicy,
         fee: NativeCurrencyAmount,
+        accept_lustrations: bool,
     ) -> RpcResult<TxCreationArtifacts> {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
@@ -3159,7 +3510,13 @@ impl RPC for NeptuneRPCServer {
             .state
             .api_mut()
             .tx_sender_mut()
-            .send(outputs, change_policy, fee, Timestamp::now())
+            .send(
+                outputs,
+                change_policy,
+                fee,
+                Timestamp::now(),
+                accept_lustrations,
+            )
             .await?)
     }
 
@@ -3180,6 +3537,28 @@ impl RPC for NeptuneRPCServer {
             .api_mut()
             .tx_initiator_mut()
             .send_transparent(outputs, change_policy, fee, Timestamp::now())
+            .await?)
+    }
+
+    // Documented in trait. Do not add doc-comment.
+    async fn consolidate(
+        mut self,
+        _ctx: context::Context,
+        token: auth::Token,
+        num_inputs: Option<usize>,
+        to_address: Option<ReceivingAddress>,
+        accept_lustration: bool,
+    ) -> RpcResult<usize> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let num_inputs = num_inputs.unwrap_or(7);
+
+        Ok(self
+            .state
+            .api_mut()
+            .tx_initiator_mut()
+            .consolidate(num_inputs, to_address, Timestamp::now(), accept_lustration)
             .await?)
     }
 
@@ -3204,14 +3583,7 @@ impl RPC for NeptuneRPCServer {
             return Ok(false);
         };
 
-        let current_msa = self
-            .state
-            .lock_guard()
-            .await
-            .chain
-            .light_state()
-            .mutator_set_accumulator_after()
-            .expect("mutator set of tip must exist");
+        let current_msa = self.state.lock_guard().await.chain.tip_mutator_set_after();
         let is_synced = tx.kernel.mutator_set_hash == current_msa.hash();
 
         let upgrade_job = match (&tx.proof, is_synced) {
@@ -3280,7 +3652,10 @@ impl RPC for NeptuneRPCServer {
         token.auth(&self.valid_tokens)?;
 
         let claim_data = self
-            .claim_utxo_inner(encrypted_utxo_notification, max_search_depth)
+            .state
+            .lock_guard()
+            .await
+            .claim_utxo(encrypted_utxo_notification, max_search_depth)
             .await?;
 
         let Some(claim_data) = claim_data else {
@@ -3296,7 +3671,7 @@ impl RPC for NeptuneRPCServer {
             .wallet_state
             .claim_utxo(claim_data)
             .await
-            .map_err(error::ClaimError::from)?;
+            .map_err(ClaimError::from)?;
 
         Ok(expected_utxo_was_new)
     }
@@ -3494,23 +3869,25 @@ impl RPC for NeptuneRPCServer {
         token.auth(&self.valid_tokens)?;
 
         // Find proposal from list of exported proposals.
-        let Some(proposal) = self
-            .state
-            .lock_guard()
-            .await
-            .mining_state
-            .exported_block_proposals
-            .get(&proposal_id)
-            .map(|x| x.to_owned())
-        else {
-            warn!(
-                "Got claimed PoW solution but no challenge was known. \
-                Did solution come in too late?"
-            );
-            return Ok(false);
+        let (proposal, tip_header) = {
+            let state = self.state.lock_guard().await;
+            let Some(proposal) = state
+                .mining_state
+                .exported_block_proposals
+                .get(&proposal_id)
+                .map(|x| x.to_owned())
+            else {
+                warn!(
+                    "Got claimed PoW solution but no challenge was known. \
+                    Did solution come in too late?"
+                );
+                return Ok(false);
+            };
+
+            (proposal, *state.chain.tip().header())
         };
 
-        self.pow_solution_inner(proposal, pow).await
+        self.pow_solution_inner(proposal, pow, tip_header).await
     }
 
     // documented in trait. do not add doc-comment.
@@ -3525,16 +3902,20 @@ impl RPC for NeptuneRPCServer {
         token.auth(&self.valid_tokens)?;
 
         // Since block comes from external source, we need to check validity.
-        let current_tip = self.state.lock_guard().await.chain.light_state().clone();
-        if !proposal
-            .is_valid(&current_tip, Timestamp::now(), self.state.cli().network)
-            .await
-        {
-            warn!("Got claimed new block that was not valid");
-            return Ok(false);
-        }
+        let tip_header = {
+            let network = self.state.cli().network;
+            let state = self.state.lock_guard().await;
+            let tip = state.chain.tip();
+            if !proposal.is_valid(tip, Timestamp::now(), network).await {
+                warn!("Got claimed new block that was not valid");
+                return Ok(false);
+            }
 
-        self.pow_solution_inner(proposal, pow).await
+            *state.chain.tip().header()
+        };
+
+        // No locks may be held here
+        self.pow_solution_inner(proposal, pow, tip_header).await
     }
 
     // documented in trait. do not add doc-comment.
@@ -3599,16 +3980,11 @@ impl RPC for NeptuneRPCServer {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
-        let state = self.state.lock_guard().await;
-        let tip = state.chain.light_state();
-        let tip_hash = tip.hash();
-        let tip_msa = tip
-            .mutator_set_accumulator_after()
-            .expect("Block from state must have mutator set after");
-
-        Ok(state
-            .wallet_state
-            .get_all_own_coins_with_possible_timelocks(&tip_msa, tip_hash)
+        Ok(self
+            .state
+            .lock_guard()
+            .await
+            .coins_with_possible_timelocks()
             .await)
     }
 
@@ -3641,29 +4017,32 @@ impl RPC for NeptuneRPCServer {
             .get_all()
             .await
         {
-            let received =
-                if let Some((_, timestamp, block_height)) = monitored_utxo.confirmed_in_block {
-                    UtxoStatusEvent::Confirmed {
-                        block_height,
-                        timestamp,
-                    }
-                } else {
-                    UtxoStatusEvent::Abandoned
-                };
-            let spent = if let Some((_, timestamp, block_height)) = monitored_utxo.spent_in_block {
-                UtxoStatusEvent::Confirmed {
-                    block_height,
-                    timestamp,
+            let received = UtxoStatusEvent::Confirmed {
+                block_height: monitored_utxo.confirmed_in_block.2,
+                timestamp: monitored_utxo.confirmed_in_block.1,
+            };
+
+            let spent = match monitored_utxo.spent {
+                MonitoredUtxoSpentStatus::Unspent => UtxoStatusEvent::None,
+                MonitoredUtxoSpentStatus::SpentInUnknownBlock => {
+                    // If spent at unknown block, assume spent when received.
+                    received
                 }
-            } else {
-                UtxoStatusEvent::None
+                MonitoredUtxoSpentStatus::SpentIn {
+                    block_height,
+                    block_timestamp,
+                    ..
+                } => UtxoStatusEvent::Confirmed {
+                    block_height,
+                    timestamp: block_timestamp,
+                },
             };
 
             if present_addition_records.insert(monitored_utxo.addition_record()) {
                 ui_utxos.push(UiUtxo {
                     received,
                     spent,
-                    aocl_leaf_index: Some(monitored_utxo.aocl_index()),
+                    aocl_leaf_index: Some(monitored_utxo.aocl_leaf_index),
                     amount: monitored_utxo.utxo.get_native_currency_amount(),
                     release_date: monitored_utxo.utxo.release_date(),
                 });
@@ -3671,7 +4050,11 @@ impl RPC for NeptuneRPCServer {
         }
 
         // get unconfirmed incoming UTXOs
-        for (incoming_utxo, addition_record) in state.wallet_state.mempool_unspent_utxos_iter() {
+        for (incoming_utxo, sender_randomness, receiver_preimage) in
+            state.wallet_state.mempool_incoming_utxos_iter()
+        {
+            let item = Tip5::hash(incoming_utxo);
+            let addition_record = commit(item, sender_randomness, receiver_preimage.hash());
             if present_addition_records.insert(addition_record) {
                 ui_utxos.push(UiUtxo {
                     received: UtxoStatusEvent::Pending,
@@ -3684,13 +4067,7 @@ impl RPC for NeptuneRPCServer {
         }
 
         // get expected UTXOs
-        for expected_utxo in state
-            .wallet_state
-            .wallet_db
-            .expected_utxos()
-            .get_all()
-            .await
-        {
+        for expected_utxo in state.wallet_state.wallet_db.all_expected_utxos().await {
             if present_addition_records.insert(expected_utxo.addition_record) {
                 ui_utxos.push(UiUtxo {
                     received: UtxoStatusEvent::Expected,
@@ -3704,7 +4081,7 @@ impl RPC for NeptuneRPCServer {
 
         // mark "spent" label on unconfirmed outgoing UTXOs as "pending"
         let mut markable_indices = HashSet::new();
-        for (_outgoing_utxo, aocl_leaf_index) in state.wallet_state.mempool_spent_utxos_iter() {
+        for (_outgoing_utxo, aocl_leaf_index) in state.wallet_state.mempool_outgoing_utxos_iter() {
             markable_indices.insert(aocl_leaf_index);
         }
         for ui_utxo in &mut ui_utxos {
@@ -3739,27 +4116,20 @@ impl RPC for NeptuneRPCServer {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
-        let Some(proposal) = self
-            .state
-            .lock_guard()
-            .await
-            .mining_state
-            .block_proposal
-            .map(|x| x.to_owned())
-        else {
-            return Ok(None);
+        let (proposal, guesser_address) = {
+            let state = self.state.lock_guard().await;
+            let Some(proposal) = state.mining_state.block_proposal.map(|x| x.to_owned()) else {
+                return Ok(None);
+            };
+
+            let (guesser_address, _) = state.mining_rewards_address();
+
+            (proposal, guesser_address)
         };
 
-        let guesser_key = self
-            .state
-            .lock_guard()
-            .await
-            .wallet_state
-            .wallet_entropy
-            .guesser_fee_key();
-
-        self.pow_puzzle_inner(guesser_key.to_address().into(), proposal)
-            .await
+        // Release lock before calling next function! Otherwise, immediate
+        // deadlock.
+        self.pow_puzzle_inner(guesser_address, proposal).await
     }
 
     // documented in trait. do not add doc-comment.
@@ -3796,7 +4166,7 @@ impl RPC for NeptuneRPCServer {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
-        let (mut proposal, latest_block_header) = {
+        let (mut proposal, difficulty) = {
             let global_state = self.state.lock_guard().await;
             let Some(proposal) = global_state
                 .mining_state
@@ -3806,12 +4176,21 @@ impl RPC for NeptuneRPCServer {
                 return Ok(None);
             };
 
-            let latest_block_header = *global_state.chain.light_state().header();
-            (proposal, latest_block_header)
+            let latest_block_header = *global_state.chain.tip().header();
+
+            let network = self.state.cli().network;
+            let next_rules = ConsensusRuleSet::infer_from(network, proposal.header().height);
+            let difficulty = if next_rules.use_parent_difficulty() {
+                latest_block_header.difficulty
+            } else {
+                proposal.header().difficulty
+            };
+            (proposal, difficulty)
         };
 
         proposal.set_header_guesser_address(guesser_fee_address);
-        let puzzle = ProofOfWorkPuzzle::new(proposal.clone(), latest_block_header.difficulty);
+
+        let puzzle = ProofOfWorkPuzzle::new(proposal.clone(), difficulty);
 
         Ok(Some((proposal, puzzle)))
     }
@@ -3821,16 +4200,28 @@ impl RPC for NeptuneRPCServer {
         self,
         _: context::Context,
         token: auth::Token,
-    ) -> RpcResult<TxInputList> {
+    ) -> RpcResult<TxInputs> {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
-        Ok(self
+        let input_candidates = self
             .state
             .api()
             .tx_initiator()
-            .spendable_inputs(Timestamp::now())
-            .await)
+            .input_candidates(Timestamp::now())
+            .await;
+
+        // Select all.
+        let selected_inputs = input_candidates.into_iter().collect_vec();
+
+        let unlocked_utxos = self
+            .state
+            .lock_guard()
+            .await
+            .unlock_inputs(selected_inputs)
+            .await;
+
+        Ok(unlocked_utxos)
     }
 
     // documented in trait. do not add doc-comment.
@@ -3840,17 +4231,27 @@ impl RPC for NeptuneRPCServer {
         token: auth::Token,
         policy: InputSelectionPolicy,
         spend_amount: NativeCurrencyAmount,
-    ) -> RpcResult<TxInputList> {
+    ) -> RpcResult<TxInputs> {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
-        Ok(self
+        let lustration_threshold = self.state.lock_guard().await.chain.lustration_threshold();
+
+        let selected_inputs = self
             .state
             .api()
             .tx_initiator()
-            .select_spendable_inputs(policy, spend_amount, Timestamp::now())
+            .select_inputs(policy, spend_amount, Timestamp::now(), lustration_threshold)
+            .await?;
+
+        let unlocked_inputs = self
+            .state
+            .lock_guard()
             .await
-            .into())
+            .unlock_inputs(selected_inputs)
+            .await;
+
+        Ok(unlocked_inputs)
     }
 
     // documented in trait. do not add doc-comment.
@@ -3876,7 +4277,7 @@ impl RPC for NeptuneRPCServer {
         self,
         _: context::Context,
         token: auth::Token,
-        tx_inputs: TxInputList,
+        tx_inputs: TxInputs,
         tx_outputs: TxOutputList,
         change_policy: ChangePolicy,
         fee: NativeCurrencyAmount,
@@ -3956,6 +4357,33 @@ impl RPC for NeptuneRPCServer {
         token.auth(&self.valid_tokens)?;
 
         Ok(self.state.api().tx_initiator().proof_type(txid).await?)
+    }
+
+    // Documented in trait. Do not add doc-comment.
+    async fn revalidate_history(
+        self,
+        _ctx: context::Context,
+        token: auth::Token,
+        first: BlockHeight,
+        last: BlockHeight,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        if last < first {
+            return Err(RpcError::BlockRangeError);
+        }
+
+        info!("Spawning task to revalidate all blocks in range: {first}..={last}");
+
+        let _handle = tokio::spawn(async move {
+            let result = self.state.revalidate_canonical_chain(first, last).await;
+            if let Err(err) = result {
+                error!("Revalidation error: {err}");
+            }
+        });
+
+        Ok(())
     }
 
     // documented in trait. do not add doc-comment.
@@ -4047,6 +4475,63 @@ impl RPC for NeptuneRPCServer {
     }
 
     // documented in trait. do not add doc-comment.
+    async fn circulating_supply(
+        self,
+        _context: tarpc::context::Context,
+        token: auth::Token,
+    ) -> RpcResult<NativeCurrencyAmount> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        Ok(self
+            .state
+            .lock_guard()
+            .await
+            .chain
+            .archival_state()
+            .circulating_supply()
+            .await)
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn max_supply(
+        self,
+        _context: tarpc::context::Context,
+        token: auth::Token,
+    ) -> RpcResult<NativeCurrencyAmount> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        Ok(self
+            .state
+            .lock_guard()
+            .await
+            .chain
+            .archival_state()
+            .max_supply()
+            .await)
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn burned_supply(
+        self,
+        _context: tarpc::context::Context,
+        token: auth::Token,
+    ) -> RpcResult<NativeCurrencyAmount> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        Ok(self
+            .state
+            .lock_guard()
+            .await
+            .chain
+            .archival_state()
+            .burned_supply()
+            .await)
+    }
+
+    // documented in trait. do not add doc-comment.
     async fn broadcast_all_mempool_txs(
         self,
         _context: tarpc::context::Context,
@@ -4107,37 +4592,20 @@ impl RPC for NeptuneRPCServer {
             (incoming_iter.collect(), outgoing_iter.collect())
         };
 
-        let tip_msah = global_state
-            .chain
-            .light_state()
-            .mutator_set_accumulator_after()
-            .expect("Block from state must have mutator set after")
-            .hash();
-
+        let tip_msah = global_state.chain.tip_mutator_set_after().hash();
         let mempool_transactions = mempool_txkids
             .iter()
             .filter_map(|id| {
-                let mut mptxi = global_state
-                    .mempool
-                    .get(*id)
-                    .map(|tx| (MempoolTransactionInfo::from(tx), tx.kernel.mutator_set_hash))
-                    .map(|(mptxi, tx_msah)| {
-                        if tx_msah == tip_msah {
-                            mptxi.synced()
-                        } else {
-                            mptxi
-                        }
-                    });
-                if mptxi.is_some() {
-                    if let Some(pos_effect) = incoming.get(id) {
-                        mptxi = Some(mptxi.unwrap().with_positive_effect_on_balance(*pos_effect));
-                    }
-                    if let Some(neg_effect) = outgoing.get(id) {
-                        mptxi = Some(mptxi.unwrap().with_negative_effect_on_balance(*neg_effect));
-                    }
-                }
-
-                mptxi
+                global_state.mempool.get(*id).map(|tx| {
+                    let pos_balance_effect = incoming.get(id).copied().unwrap_or_default();
+                    let neg_balance_effect = outgoing.get(id).copied().unwrap_or_default();
+                    MempoolTransactionInfo::new(
+                        tx,
+                        tx.kernel.mutator_set_hash == tip_msah,
+                        pos_balance_effect,
+                        neg_balance_effect,
+                    )
+                })
             })
             .collect_vec();
 
@@ -4196,8 +4664,17 @@ pub mod error {
         #[error("send error: {0}")]
         SendError(String),
 
+        #[error("consolidation error: {0}")]
+        ConsolidationError(String),
+
         #[error("regtest error: {0}")]
         RegTestError(String),
+
+        #[error("invalid block range")]
+        BlockRangeError,
+
+        #[error("node not started with UTXO index")]
+        UtxoIndexNotPresent,
 
         #[error("wallet error: {0}")]
         WalletError(String),
@@ -4219,6 +4696,12 @@ pub mod error {
 
         #[error("Wallet key counter is zero. Must be positive after init")]
         WalletKeyCounterIsZero,
+
+        #[error("Access to this endpoint is restricted")]
+        RestrictedAccess,
+
+        #[error("Derivation index must be in interval [{0}, {1}]")]
+        InvalidDerivationIndexRange(u64, u64),
     }
 
     impl From<tx_initiation::error::CreateTxError> for RpcError {
@@ -4239,6 +4722,12 @@ pub mod error {
         }
     }
 
+    impl From<ConsolidationError> for RpcError {
+        fn from(err: ConsolidationError) -> Self {
+            RpcError::ConsolidationError(err.to_string())
+        }
+    }
+
     impl From<api::regtest::error::RegTestError> for RpcError {
         fn from(err: api::regtest::error::RegTestError) -> Self {
             RpcError::RegTestError(err.to_string())
@@ -4251,38 +4740,9 @@ pub mod error {
         }
     }
 
-    impl From<ClaimError> for RpcError {
-        fn from(err: ClaimError) -> Self {
-            RpcError::ClaimError(err.to_string())
-        }
-    }
-
     // convert anyhow::Error to an RpcError::Failed.
     // note that anyhow Error is not serializable.
     impl From<anyhow::Error> for RpcError {
-        fn from(e: anyhow::Error) -> Self {
-            Self::Failed(e.to_string())
-        }
-    }
-
-    /// enumerates possible transaction send errors
-    #[derive(Debug, Clone, thiserror::Error, Serialize, Deserialize)]
-    #[non_exhaustive]
-    pub enum ClaimError {
-        #[error("utxo does not match any known wallet key")]
-        UtxoUnknown,
-
-        #[error("invalid type script in claim utxo")]
-        InvalidTypeScript,
-
-        // catch-all error, eg for anyhow errors
-        #[error("claim unsuccessful")]
-        Failed(String),
-    }
-
-    // convert anyhow::Error to a ClaimError::Failed.
-    // note that anyhow Error is not serializable.
-    impl From<anyhow::Error> for ClaimError {
         fn from(e: anyhow::Error) -> Self {
             Self::Failed(e.to_string())
         }
@@ -4301,9 +4761,12 @@ mod tests {
     use rand::Rng;
     use rand::SeedableRng;
     use strum::IntoEnumIterator;
+    use tasm_lib::prelude::Tip5;
+    use tasm_lib::twenty_first::bfe;
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::api::export::TxProvingCapability;
     use crate::application::config::cli_args;
     use crate::application::config::network::Network;
     use crate::application::database::storage::storage_vec::traits::*;
@@ -4323,6 +4786,7 @@ mod tests {
     use crate::tests::shared::strategies::txkernel;
     use crate::tests::shared_tokio_runtime;
     use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
+    use crate::BFieldElement;
     use crate::Block;
 
     const NUM_ANNOUNCEMENTS_BLOCK1: usize = 7;
@@ -4453,6 +4917,17 @@ mod tests {
             .await;
         let _ = rpc_server
             .clone()
+            .block_heights_by_announcement_flags(
+                ctx,
+                token,
+                vec![AnnouncementFlag {
+                    flag: bfe!(0),
+                    receiver_id: bfe!(0),
+                }],
+            )
+            .await;
+        let _ = rpc_server
+            .clone()
             .block_digest(ctx, token, BlockSelector::Digest(Digest::default()))
             .await;
         let _ = rpc_server.clone().utxo_digest(ctx, token, 0).await;
@@ -4502,7 +4977,7 @@ mod tests {
             .select_spendable_inputs(
                 ctx,
                 token,
-                InputSelectionPolicy::Random,
+                InputSelectionPolicy::default(),
                 NativeCurrencyAmount::coins(5),
             )
             .await;
@@ -4516,7 +4991,7 @@ mod tests {
             .generate_tx_details(
                 ctx,
                 token,
-                TxInputList::default(),
+                TxInputs::default(),
                 TxOutputList::default(),
                 ChangePolicy::default(),
                 NativeCurrencyAmount::zero(),
@@ -4577,12 +5052,26 @@ mod tests {
             .into();
         let _ = rpc_server
             .clone()
+            .rescan_announced(ctx, token, 0u64.into(), 14u64.into(), None)
+            .await;
+        let _ = rpc_server
+            .clone()
+            .rescan_expected(ctx, token, 0u64.into(), 14u64.into())
+            .await;
+        let _ = rpc_server.clone().rescan_outgoing(ctx, token).await;
+        let _ = rpc_server
+            .clone()
+            .rescan_guesser_rewards(ctx, token, 0u64.into(), 14u64.into())
+            .await;
+        let _ = rpc_server
+            .clone()
             .send(
                 ctx,
                 token,
                 vec![output],
                 ChangePolicy::ExactChange,
                 NativeCurrencyAmount::one_nau(),
+                true,
             )
             .await;
         let _ = rpc_server
@@ -4601,6 +5090,7 @@ mod tests {
                 vec![my_output],
                 ChangePolicy::ExactChange,
                 NativeCurrencyAmount::one_nau(),
+                true,
             )
             .await;
 
@@ -4725,7 +5215,7 @@ mod tests {
             .select_spendable_inputs(
                 ctx,
                 token,
-                InputSelectionPolicy::Random,
+                InputSelectionPolicy::default(),
                 NativeCurrencyAmount::coins(19),
             )
             .await
@@ -4826,12 +5316,15 @@ mod tests {
         .await;
         let token = cookie_token(&rpc_server).await;
         let rpc_request_context = context::current();
-        let (peer_address0, peer_address1) = {
+        let (peer_id0, peer_address0, peer_id1, peer_address1) = {
             let global_state = rpc_server.state.lock_guard().await;
 
+            let entries = global_state.net.peer_map.iter().collect::<Vec<_>>();
             (
-                global_state.net.peer_map.values().collect::<Vec<_>>()[0].connected_address(),
-                global_state.net.peer_map.values().collect::<Vec<_>>()[1].connected_address(),
+                *entries[0].0,
+                entries[0].1.address(),
+                *entries[1].0,
+                entries[1].1.address(),
             )
         };
 
@@ -4852,7 +5345,7 @@ mod tests {
             global_state_mut
                 .net
                 .peer_map
-                .entry(peer_address0)
+                .entry(peer_id0)
                 .and_modify(|p| {
                     p.standing
                         .sanction(PeerSanction::Negative(
@@ -4863,7 +5356,7 @@ mod tests {
             global_state_mut
                 .net
                 .peer_map
-                .entry(peer_address1)
+                .entry(peer_id1)
                 .and_modify(|p| {
                     p.standing
                         .sanction(PeerSanction::Negative(
@@ -4871,8 +5364,8 @@ mod tests {
                         ))
                         .unwrap_err();
                 });
-            let standing_0 = global_state_mut.net.peer_map[&peer_address0].standing;
-            let standing_1 = global_state_mut.net.peer_map[&peer_address1].standing;
+            let standing_0 = global_state_mut.net.peer_map[&peer_id0].standing;
+            let standing_1 = global_state_mut.net.peer_map[&peer_id1].standing;
             (standing_0, standing_1)
         };
 
@@ -4887,16 +5380,33 @@ mod tests {
             "Punished list must have two elements after sanctionings"
         );
 
+        let ip0 = peer_address0
+            .iter()
+            .find_map(|component| match component {
+                Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+                Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+                _ => None,
+            })
+            .unwrap();
+        let ip1 = peer_address1
+            .iter()
+            .find_map(|component| match component {
+                Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+                Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+                _ => None,
+            })
+            .unwrap();
+
         {
             let mut global_state_mut = rpc_server.state.lock_guard_mut().await;
 
             global_state_mut
                 .net
-                .write_peer_standing_on_decrease(peer_address0.ip(), standing0)
+                .write_peer_standing_on_decrease(ip0, standing0)
                 .await;
             global_state_mut
                 .net
-                .write_peer_standing_on_decrease(peer_address1.ip(), standing1)
+                .write_peer_standing_on_decrease(ip1, standing1)
                 .await;
         }
 
@@ -4914,16 +5424,10 @@ mod tests {
         // Verify expected initial conditions
         {
             let global_state = rpc_server.state.lock_guard().await;
-            let standing0 = global_state
-                .net
-                .get_peer_standing_from_database(peer_address0.ip())
-                .await;
+            let standing0 = global_state.net.get_peer_standing_from_database(ip0).await;
             assert_ne!(0, standing0.unwrap().standing);
             assert_ne!(None, standing0.unwrap().latest_punishment);
-            let peer_standing_1 = global_state
-                .net
-                .get_peer_standing_from_database(peer_address1.ip())
-                .await;
+            let peer_standing_1 = global_state.net.get_peer_standing_from_database(ip1).await;
             assert_ne!(0, peer_standing_1.unwrap().standing);
             assert_ne!(None, peer_standing_1.unwrap().latest_punishment);
             drop(global_state);
@@ -4931,30 +5435,24 @@ mod tests {
             // Clear standing of #0
             rpc_server
                 .clone()
-                .clear_standing_by_ip(rpc_request_context, token, peer_address0.ip())
+                .clear_standing_by_ip(rpc_request_context, token, ip0)
                 .await?;
         }
 
         // Verify expected resulting conditions in database
         {
             let global_state = rpc_server.state.lock_guard().await;
-            let standing0 = global_state
-                .net
-                .get_peer_standing_from_database(peer_address0.ip())
-                .await;
+            let standing0 = global_state.net.get_peer_standing_from_database(ip0).await;
             assert_eq!(0, standing0.unwrap().standing);
             assert_eq!(None, standing0.unwrap().latest_punishment);
-            let standing1 = global_state
-                .net
-                .get_peer_standing_from_database(peer_address1.ip())
-                .await;
+            let standing1 = global_state.net.get_peer_standing_from_database(ip1).await;
             assert_ne!(0, standing1.unwrap().standing);
             assert_ne!(None, standing1.unwrap().latest_punishment);
 
             // Verify expected resulting conditions in peer map
-            let standing0_from_memory = global_state.net.peer_map[&peer_address0].clone();
+            let standing0_from_memory = global_state.net.peer_map[&peer_id0].clone();
             assert_eq!(0, standing0_from_memory.standing.standing);
-            let standing1_from_memory = global_state.net.peer_map[&peer_address1].clone();
+            let standing1_from_memory = global_state.net.peer_map[&peer_id1].clone();
             assert_ne!(0, standing1_from_memory.standing.standing);
         }
 
@@ -4984,19 +5482,44 @@ mod tests {
         .await;
         let token = cookie_token(&rpc_server).await;
         let mut state = rpc_server.state.lock_guard_mut().await;
-        let peer_address0 = state.net.peer_map.values().collect::<Vec<_>>()[0].connected_address();
-        let peer_address1 = state.net.peer_map.values().collect::<Vec<_>>()[1].connected_address();
+
+        let (peer_id0, peer_address0, peer_id1, peer_address1) = {
+            let entries = state.net.peer_map.iter().collect::<Vec<_>>();
+            (
+                *entries[0].0,
+                entries[0].1.address(),
+                *entries[1].0,
+                entries[1].1.address(),
+            )
+        };
+
+        let ip0 = peer_address0
+            .iter()
+            .find_map(|component| match component {
+                Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+                Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+                _ => None,
+            })
+            .unwrap();
+        let ip1 = peer_address1
+            .iter()
+            .find_map(|component| match component {
+                Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+                Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+                _ => None,
+            })
+            .unwrap();
 
         // sanction both peers
         let (standing0, standing1) = {
-            state.net.peer_map.entry(peer_address0).and_modify(|p| {
+            state.net.peer_map.entry(peer_id0).and_modify(|p| {
                 p.standing
                     .sanction(PeerSanction::Negative(
                         NegativePeerSanction::DifferentGenesis,
                     ))
                     .unwrap_err();
             });
-            state.net.peer_map.entry(peer_address1).and_modify(|p| {
+            state.net.peer_map.entry(peer_id1).and_modify(|p| {
                 p.standing
                     .sanction(PeerSanction::Negative(
                         NegativePeerSanction::DifferentGenesis,
@@ -5004,18 +5527,18 @@ mod tests {
                     .unwrap_err();
             });
             (
-                state.net.peer_map[&peer_address0].standing,
-                state.net.peer_map[&peer_address1].standing,
+                state.net.peer_map[&peer_id0].standing,
+                state.net.peer_map[&peer_id1].standing,
             )
         };
 
         state
             .net
-            .write_peer_standing_on_decrease(peer_address0.ip(), standing0)
+            .write_peer_standing_on_decrease(ip0, standing0)
             .await;
         state
             .net
-            .write_peer_standing_on_decrease(peer_address1.ip(), standing1)
+            .write_peer_standing_on_decrease(ip1, standing1)
             .await;
 
         drop(state);
@@ -5027,7 +5550,7 @@ mod tests {
                 .lock_guard_mut()
                 .await
                 .net
-                .get_peer_standing_from_database(peer_address0.ip())
+                .get_peer_standing_from_database(ip0)
                 .await;
             assert_ne!(0, peer_standing0.unwrap().standing);
             assert_ne!(None, peer_standing0.unwrap().latest_punishment);
@@ -5039,7 +5562,7 @@ mod tests {
                 .lock_guard_mut()
                 .await
                 .net
-                .get_peer_standing_from_database(peer_address1.ip())
+                .get_peer_standing_from_database(ip1)
                 .await;
             assert_ne!(0, peer_standing1.unwrap().standing);
             assert_ne!(None, peer_standing1.unwrap().latest_punishment);
@@ -5063,31 +5586,25 @@ mod tests {
 
         // Verify expected resulting conditions in database
         {
-            let peer_standing_0 = state
-                .net
-                .get_peer_standing_from_database(peer_address0.ip())
-                .await;
+            let peer_standing_0 = state.net.get_peer_standing_from_database(ip0).await;
             assert_eq!(0, peer_standing_0.unwrap().standing);
             assert_eq!(None, peer_standing_0.unwrap().latest_punishment);
         }
 
         {
-            let peer_still_standing_1 = state
-                .net
-                .get_peer_standing_from_database(peer_address1.ip())
-                .await;
+            let peer_still_standing_1 = state.net.get_peer_standing_from_database(ip1).await;
             assert_eq!(0, peer_still_standing_1.unwrap().standing);
             assert_eq!(None, peer_still_standing_1.unwrap().latest_punishment);
         }
 
         // Verify expected resulting conditions in peer map
         {
-            let peer_standing_0_from_memory = state.net.peer_map[&peer_address0].clone();
+            let peer_standing_0_from_memory = state.net.peer_map[&peer_id0].clone();
             assert_eq!(0, peer_standing_0_from_memory.standing.standing);
         }
 
         {
-            let peer_still_standing_1_from_memory = state.net.peer_map[&peer_address1].clone();
+            let peer_still_standing_1_from_memory = state.net.peer_map[&peer_id1].clone();
             assert_eq!(0, peer_still_standing_1_from_memory.standing.standing);
         }
 
@@ -5123,7 +5640,7 @@ mod tests {
             .num_leafs()
             .await;
 
-        debug_assert!(aocl_leaves > 0);
+        assert!(aocl_leaves > 0);
 
         assert!(rpc_server
             .clone()
@@ -5232,7 +5749,7 @@ mod tests {
         let ctx = context::current();
 
         let genesis_hash = global_state.chain.archival_state().genesis_block().hash();
-        let tip_hash = global_state.chain.light_state().hash();
+        let tip_hash = global_state.chain.tip_hash();
 
         let genesis_block_info = BlockInfo::new(
             global_state.chain.archival_state().genesis_block(),
@@ -5252,7 +5769,7 @@ mod tests {
         );
 
         let tip_block_info = BlockInfo::new(
-            global_state.chain.light_state(),
+            global_state.chain.tip(),
             genesis_hash,
             tip_hash,
             vec![],
@@ -5440,7 +5957,7 @@ mod tests {
 
         // should find latest/tip block by Tip selector
         assert_eq!(
-            global_state.chain.light_state().hash(),
+            global_state.chain.tip().hash(),
             rpc_server
                 .clone()
                 .block_digest(
@@ -5535,6 +6052,7 @@ mod tests {
         let token = cookie_token(&rpc_server).await;
 
         let output: OutputFormat = (address.into(), amount).into();
+        let accept_lustrations = true;
         assert!(rpc_server
             .clone()
             .send(
@@ -5542,12 +6060,14 @@ mod tests {
                 token,
                 vec![output],
                 ChangePolicy::ExactChange,
-                NativeCurrencyAmount::zero()
+                NativeCurrencyAmount::zero(),
+                accept_lustrations,
             )
             .await
             .is_err());
     }
 
+    #[traced_test]
     #[apply(shared_tokio_runtime)]
     async fn coinbase_distribution_happy_path() {
         let network = Network::Main;
@@ -5566,6 +6086,7 @@ mod tests {
         let cli = cli_args::Args {
             network,
             compose: true,
+            tx_proving_capability: Some(TxProvingCapability::SingleProof),
             ..Default::default()
         };
         let rpc_server = test_rpc_server(WalletEntropy::new_random(), 2, cli).await;
@@ -5615,9 +6136,9 @@ mod tests {
             .state
             .lock_guard()
             .await
-            .wallet_spendable_inputs(Timestamp::now())
+            .wallet_spendable_inputs()
             .await
-            .into_iter()
+            .iter()
             .collect_vec()[0]
             .clone();
         let msmp = utxo.mutator_set_mp().clone();
@@ -5761,7 +6282,7 @@ mod tests {
                 .to_address();
             let bob_token = cookie_token(&bob).await;
 
-            let (proposal, puzzle) = bob
+            let (proposal_block1, puzzle) = bob
                 .clone()
                 .full_pow_puzzle_external_key(context::current(), bob_token, guesser_address)
                 .await
@@ -5774,23 +6295,28 @@ mod tests {
                         context::current(),
                         bob_token,
                         Default::default(),
-                        proposal.clone()
+                        proposal_block1.clone()
                     )
                     .await
                     .unwrap(),
                 "Node must reject new tip with invalid PoW solution."
             );
 
-            let solution = puzzle.solve(ConsensusRuleSet::default());
+            let solution = puzzle.solve(ConsensusRuleSet::Reboot);
             assert!(
                 bob.clone()
-                    .provide_new_tip(context::current(), bob_token, solution, proposal.clone())
+                    .provide_new_tip(
+                        context::current(),
+                        bob_token,
+                        solution,
+                        proposal_block1.clone()
+                    )
                     .await
                     .unwrap(),
                 "Node must accept valid new tip."
             );
 
-            let mut bad_proposal = proposal;
+            let mut bad_proposal = proposal_block1;
             bad_proposal.set_proof(BlockProof::SingleProof(NeptuneProof::invalid()));
             assert!(
                 !bob.clone()
@@ -5965,6 +6491,7 @@ mod tests {
                 let consensus_rule_set = ConsensusRuleSet::Reboot;
                 let guesser_buffer = block1.guess_preprocess(None, None, consensus_rule_set);
                 let mast_auth_paths = block1.pow_mast_paths();
+                let version = block1.header().version;
                 let index_picker_preimage = guesser_buffer.index_picker_preimage(&mast_auth_paths);
                 let target = genesis.header().difficulty.target();
                 let valid_pow = loop {
@@ -5974,6 +6501,8 @@ mod tests {
                         index_picker_preimage,
                         random(),
                         target,
+                        None,
+                        Some(version),
                     ) {
                         break valid_pow;
                     }
@@ -6121,6 +6650,7 @@ mod tests {
                         .await
                         .unwrap();
 
+                    let accept_lustrations = true;
                     let tx_artifacts = rpc_server
                         .clone()
                         .send(
@@ -6132,6 +6662,7 @@ mod tests {
                                 UtxoNotificationMedium::OffChain,
                             ),
                             fee,
+                            accept_lustrations,
                         )
                         .await
                         .unwrap();
@@ -6292,6 +6823,7 @@ mod tests {
                 .collect();
 
                 let fee = NativeCurrencyAmount::coins(2);
+                let accept_lustrations = true;
                 let tx_artifacts = bob
                     .clone()
                     .send(
@@ -6303,6 +6835,7 @@ mod tests {
                             UtxoNotificationMedium::OffChain,
                         ),
                         fee,
+                        accept_lustrations,
                     )
                     .await
                     .unwrap();
@@ -6338,6 +6871,7 @@ mod tests {
                                 vec![output],
                                 ChangePolicy::exact_change(),
                                 NativeCurrencyAmount::zero(),
+                                accept_lustrations,
                             )
                             .await
                             .unwrap();
@@ -6456,6 +6990,7 @@ mod tests {
             let fee = NativeCurrencyAmount::zero();
 
             // note: we can only perform 2 iters, else we bump into send rate-limit (per block)
+            let accept_lustrations = true;
             for i in 5..7 {
                 let result = rpc_server
                     .clone()
@@ -6465,6 +7000,7 @@ mod tests {
                         outputs.clone().take(i).collect(),
                         ChangePolicy::ExactChange,
                         fee,
+                        accept_lustrations,
                     )
                     .await;
                 assert!(result.is_ok());
@@ -6512,11 +7048,19 @@ mod tests {
 
             let output: OutputFormat = (address, amount, UtxoNotificationMedium::OnChain).into();
             let outputs = vec![output];
+            let accept_lustrations = true;
 
             for i in 0..10 {
                 let result = rpc_server
                     .clone()
-                    .send(ctx, token, outputs.clone(), ChangePolicy::Burn, fee)
+                    .send(
+                        ctx,
+                        token,
+                        outputs.clone(),
+                        ChangePolicy::Burn,
+                        fee,
+                        accept_lustrations,
+                    )
                     .await;
 
                 // any attempts after the 2nd send should result in RateLimit error.
@@ -6595,8 +7139,10 @@ mod tests {
 
                 {
                     let state_lock = rpc_server.state.lock_guard().await;
+                    let block_height = state_lock.chain.tip().header().height;
                     let wallet_status = state_lock.get_wallet_status_for_tip().await;
-                    let original_balance = wallet_status.available_confirmed(timestamp);
+                    let original_balance =
+                        wallet_status.confirmed_available_balance(block_height, timestamp);
                     assert!(original_balance.is_zero(), "Original balance assumed zero");
                 };
 
@@ -6609,7 +7155,9 @@ mod tests {
                 {
                     let state_lock = rpc_server.state.lock_guard().await;
                     let wallet_status = state_lock.get_wallet_status_for_tip().await;
-                    let new_balance = wallet_status.available_confirmed(timestamp);
+                    let block_height = state_lock.chain.tip().header().height;
+                    let new_balance =
+                        wallet_status.confirmed_available_balance(block_height, timestamp);
                     let mut expected_balance = Block::block_subsidy(block_1.header().height);
                     expected_balance.div_two();
                     assert_eq!(
@@ -6669,6 +7217,7 @@ mod tests {
                 // timestamp. Otherwise, proofs cannot be reused, and CI will
                 // fail. CI might also fail if you don't set an explicit proving
                 // capability.
+                let accept_lustrations = true;
                 let result = rpc_server
                     .clone()
                     .send(
@@ -6680,6 +7229,7 @@ mod tests {
                             UtxoNotificationMedium::OffChain,
                         ),
                         fee,
+                        accept_lustrations,
                     )
                     .await;
 

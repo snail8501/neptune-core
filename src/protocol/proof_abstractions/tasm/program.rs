@@ -17,17 +17,14 @@ use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 
 #[derive(Debug, Clone)]
-pub enum ConsensusError {
+pub enum TritonError {
     RustShadowPanic(String),
     TritonVMPanic(String, InstructionError),
 }
 
-/// A `ConsensusProgram` represents the logic subprogram for transaction or
+/// A [`TritonProgram`] represents the logic subprogram for transaction or
 /// block validity.
-///
-/// This trait is required for benchmarks, but is not part of the public API.
-#[doc(hidden)]
-pub trait ConsensusProgram
+pub trait TritonProgram
 where
     Self: RefUnwindSafe + std::fmt::Debug,
 {
@@ -90,11 +87,11 @@ where
 /// there, generate it and store it to disk.
 ///
 /// This method works for arbitrary programs, including ones that do not
-/// implement trait [`ConsensusProgram`].
+/// implement trait [`TritonProgram`].
 ///
 /// The proof is executed as a triton-vm-job-queue job which ensures that
 /// no two tasks run the prover simultaneously.
-pub(crate) async fn prove_consensus_program(
+pub(crate) async fn prove_triton_program(
     program: Program,
     claim: Claim,
     nondeterminism: NonDeterminism,
@@ -103,7 +100,7 @@ pub(crate) async fn prove_consensus_program(
 ) -> Result<Proof, CreateProofError> {
     // regtest mode: just return a mock (empty) Proof
     if proof_job_options.job_settings.network.use_mock_proof() {
-        return Ok(Proof::valid_mock(claim));
+        return Ok(Proof::valid_mock());
     }
 
     // create a triton-vm-job-queue job for generating this proof.
@@ -170,6 +167,128 @@ pub struct TritonVmProofJobOptions {
     pub cancel_job_rx: Option<tokio::sync::watch::Receiver<()>>,
 }
 
+#[cfg(any(test, feature = "spec"))]
+pub mod spec {
+    use std::panic::catch_unwind;
+
+    use itertools::Itertools;
+    use tracing::debug;
+
+    use super::*;
+    use crate::protocol::proof_abstractions::tasm::environment;
+
+    pub trait TritonProgramSpecification: TritonProgram {
+        /// The canonical reference source code for the Triton program, written
+        /// in the subset of rust that the tasm-lang compiler understands. To
+        /// run this program, call [`Self::run_rust`], which spawns a new
+        /// thread, boots the environment, and executes the program.
+        fn source(&self);
+
+        /// Run the source program natively in rust, but with the emulated TritonVM
+        /// environment for input, output, nondeterminism, and program digest.
+        fn run_rust(
+            &self,
+            input: &PublicInput,
+            nondeterminism: NonDeterminism,
+        ) -> Result<Vec<BFieldElement>, TritonError> {
+            debug!(
+                "Running triton program with input: {}",
+                input.individual_tokens.iter().map(|b| b.value()).join(",")
+            );
+            let program_digest = catch_unwind(|| self.hash()).unwrap_or_default();
+            let emulation_result = catch_unwind(|| {
+                environment::init(program_digest, &input.individual_tokens, nondeterminism);
+                self.source();
+                environment::audit_end_state();
+                environment::PUB_OUTPUT.take()
+            });
+
+            emulation_result.map_err(|e| TritonError::RustShadowPanic(format!("{e:?}")))
+        }
+
+        /// Use Triton VM to run the tasm code.
+        ///
+        /// Only used in tests, since in production, you always need the proofs.
+        fn run_tasm(
+            &self,
+            input: &PublicInput,
+            nondeterminism: NonDeterminism,
+        ) -> Result<Vec<BFieldElement>, TritonError> {
+            let mut vm_state = VMState::new(self.program(), input.clone(), nondeterminism.clone());
+            tasm_lib::maybe_write_debuggable_vm_state_to_disk(&vm_state);
+
+            let init_stack = vm_state.op_stack.clone();
+            if let Err(err) = vm_state.run() {
+                let err_str = format!("Triton VM failed.\nError: {err}\nVMState:\n{vm_state}");
+                eprintln!("{err_str}");
+                return Err(TritonError::TritonVMPanic(err_str, err));
+            }
+
+            // Do some sanity checks that are likely to catch programming
+            // errors in the Triton program. This doesn't catch
+            // soundness errors, though, since a valid proof could still be
+            // generated even though one of these checks fail.
+            assert!(
+                vm_state.secret_digests.is_empty(),
+                "Secret digest list must be empty after executing Triton program"
+            );
+            assert!(
+                vm_state.secret_individual_tokens.is_empty(),
+                "Secret token list must be empty after executing Triton program"
+            );
+            assert!(
+                vm_state.public_input.is_empty(),
+                "input must be empty after executing Triton program"
+            );
+            assert_eq!(&init_stack, &vm_state.op_stack);
+
+            Ok(vm_state.public_output)
+        }
+
+        /// `Ok(())` iff the given input & non-determinism triggers the failure of
+        /// either the instruction `assert` or `assert_vector`, and if that
+        /// instruction's error ID is one of the expected error IDs.
+        fn test_assertion_failure(
+            &self,
+            public_input: PublicInput,
+            non_determinism: NonDeterminism,
+            expected_error_ids: &[i128],
+        ) -> proptest::test_runner::TestCaseResult {
+            let fail =
+                |reason: String| Err(proptest::test_runner::TestCaseError::Fail(reason.into()));
+
+            let tasm_result = self.run_tasm(&public_input, non_determinism.clone());
+            let Err(TritonError::TritonVMPanic(_, err)) = tasm_result else {
+                return fail("expected a failure in Triton VM, but it halted gracefully".into());
+            };
+
+            let (InstructionError::AssertionFailed(err)
+            | InstructionError::VectorAssertionFailed(_, err)) = err
+            else {
+                return fail(format!("expected an assertion failure, but got: {err}"));
+            };
+
+            let ids_str = expected_error_ids.iter().join(", ");
+            let expected_ids_str = format!("expected an error ID in {{{ids_str}}}");
+            let Some(err_id) = err.id else {
+                return fail(format!("{expected_ids_str}, but found none"));
+            };
+
+            proptest::prop_assert!(
+                expected_error_ids.contains(&err_id),
+                "{expected_ids_str}, but found {err_id}",
+            );
+
+            let rust_result = self.run_rust(&public_input, non_determinism.clone());
+            let Err(TritonError::RustShadowPanic(_)) = rust_result else {
+                return fail("rust shadowing must fail, but did not".into());
+            };
+
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub mod tests {
@@ -177,7 +296,6 @@ pub mod tests {
     use std::fs::File;
     use std::io::stdout;
     use std::io::Write;
-    use std::panic::catch_unwind;
     use std::path::Path;
     use std::path::PathBuf;
     use std::time::SystemTime;
@@ -191,10 +309,12 @@ pub mod tests {
     use crate::api::export::Network;
     use crate::application::config::triton_vm_env_vars::TritonVmEnvVars;
     use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
-    use crate::protocol::proof_abstractions::tasm::environment;
     use crate::state::transaction::tx_proving_capability::TxProvingCapability;
+    use crate::tests::shared::files::headers_for_proof_server_request;
+    use crate::tests::shared::files::load_test_proof_servers;
     use crate::tests::shared::files::test_helper_data_dir;
-    use crate::tests::shared::files::try_fetch_file_from_server;
+    use crate::tests::shared::files::try_fetch_file;
+    use crate::tests::shared::files::try_fetch_from_server;
     use crate::tests::shared::files::try_load_file_from_disk;
     use crate::tests::shared_tokio_runtime;
     use crate::triton_vm::stark::Stark;
@@ -241,117 +361,6 @@ pub mod tests {
                 },
                 cancel_job_rx: None,
             }
-        }
-    }
-
-    pub(crate) trait ConsensusProgramSpecification: ConsensusProgram {
-        /// The canonical reference source code for the consensus program, written in
-        /// the subset of rust that the tasm-lang compiler understands. To run this
-        /// program, call [`Self::run_rust`], which spawns a new thread, boots the
-        /// environment, and executes the program.
-        fn source(&self);
-
-        /// Run the source program natively in rust, but with the emulated TritonVM
-        /// environment for input, output, nondeterminism, and program digest.
-        fn run_rust(
-            &self,
-            input: &PublicInput,
-            nondeterminism: NonDeterminism,
-        ) -> Result<Vec<BFieldElement>, ConsensusError> {
-            debug!(
-                "Running consensus program with input: {}",
-                input.individual_tokens.iter().map(|b| b.value()).join(",")
-            );
-            let program_digest = catch_unwind(|| self.hash()).unwrap_or_default();
-            let emulation_result = catch_unwind(|| {
-                environment::init(program_digest, &input.individual_tokens, nondeterminism);
-                self.source();
-                environment::audit_end_state();
-                environment::PUB_OUTPUT.take()
-            });
-
-            emulation_result.map_err(|e| ConsensusError::RustShadowPanic(format!("{e:?}")))
-        }
-
-        /// Use Triton VM to run the tasm code.
-        ///
-        /// Only used in tests, since in production, you always need the proofs.
-        fn run_tasm(
-            &self,
-            input: &PublicInput,
-            nondeterminism: NonDeterminism,
-        ) -> Result<Vec<BFieldElement>, ConsensusError> {
-            let mut vm_state = VMState::new(self.program(), input.clone(), nondeterminism.clone());
-            tasm_lib::maybe_write_debuggable_vm_state_to_disk(&vm_state);
-
-            let init_stack = vm_state.op_stack.clone();
-            if let Err(err) = vm_state.run() {
-                let err_str = format!("Triton VM failed.\nError: {err}\nVMState:\n{vm_state}");
-                eprintln!("{err_str}");
-                return Err(ConsensusError::TritonVMPanic(err_str, err));
-            }
-
-            // Do some sanity checks that are likely to catch programming
-            // errors in the consensus program. This doesn't catch
-            // soundness errors, though, since a valid proof could still be
-            // generated even though one of these checks fail.
-            assert!(
-                vm_state.secret_digests.is_empty(),
-                "Secret digest list must be empty after executing consensus program"
-            );
-            assert!(
-                vm_state.secret_individual_tokens.is_empty(),
-                "Secret token list must be empty after executing consensus program"
-            );
-            assert!(
-                vm_state.public_input.is_empty(),
-                "input must be empty after executing consensus program"
-            );
-            assert_eq!(&init_stack, &vm_state.op_stack);
-
-            Ok(vm_state.public_output)
-        }
-
-        /// `Ok(())` iff the given input & non-determinism triggers the failure of
-        /// either the instruction `assert` or `assert_vector`, and if that
-        /// instruction's error ID is one of the expected error IDs.
-        fn test_assertion_failure(
-            &self,
-            public_input: PublicInput,
-            non_determinism: NonDeterminism,
-            expected_error_ids: &[i128],
-        ) -> proptest::test_runner::TestCaseResult {
-            let fail =
-                |reason: String| Err(proptest::test_runner::TestCaseError::Fail(reason.into()));
-
-            let tasm_result = self.run_tasm(&public_input, non_determinism.clone());
-            let Err(ConsensusError::TritonVMPanic(_, err)) = tasm_result else {
-                return fail("expected a failure in Triton VM, but it halted gracefully".into());
-            };
-
-            let (InstructionError::AssertionFailed(err)
-            | InstructionError::VectorAssertionFailed(_, err)) = err
-            else {
-                return fail(format!("expected an assertion failure, but got: {err}"));
-            };
-
-            let ids_str = expected_error_ids.iter().join(", ");
-            let expected_ids_str = format!("expected an error ID in {{{ids_str}}}");
-            let Some(err_id) = err.id else {
-                return fail(format!("{expected_ids_str}, but found none"));
-            };
-
-            proptest::prop_assert!(
-                expected_error_ids.contains(&err_id),
-                "{expected_ids_str}, but found {err_id}",
-            );
-
-            let rust_result = self.run_rust(&public_input, non_determinism.clone());
-            let Err(ConsensusError::RustShadowPanic(_)) = rust_result else {
-                return fail("rust shadowing must fail, but did not".into());
-            };
-
-            Ok(())
         }
     }
 
@@ -447,36 +456,43 @@ pub mod tests {
         Some(proof)
     }
 
+    fn decode_proof_from_server(data: Vec<u8>, server: &str) -> Option<Proof> {
+        let mut proof_data = vec![];
+        for ch in data.chunks(8) {
+            if let Ok(eight_bytes) = TryInto::<[u8; 8]>::try_into(ch) {
+                proof_data.push(BFieldElement::new(u64::from_be_bytes(eight_bytes)));
+            } else {
+                eprintln!("cannot cast chunk to eight bytes. Server was: {server}");
+                return None;
+            }
+        }
+
+        let proof = Proof::from(proof_data);
+
+        Some(proof)
+    }
+
     /// Tries to fetch a proof from a server, does not validate the proof
     ///
     /// If a proof was found, returns it along with the URL of the server
     /// serving the proof. The caller should validate the proof. Does
     /// not store the proof to disk.
-    /// TODO: Consider making this async.
     fn try_fetch_from_server_inner(filename: String) -> Option<(Proof, String)> {
-        let (file_contents, server) = try_fetch_file_from_server(filename)?;
+        let (file_contents, server) = try_fetch_file(filename)?;
 
-        let mut proof_data = vec![];
-        for ch in file_contents.chunks(8) {
-            if let Ok(eight_bytes) = TryInto::<[u8; 8]>::try_into(ch) {
-                proof_data.push(BFieldElement::new(u64::from_be_bytes(eight_bytes)));
-            } else {
-                eprintln!("cannot cast chunk to eight bytes. Server was: {server}");
-            }
-        }
-
-        let proof = Proof::from(proof_data);
+        let proof = decode_proof_from_server(file_contents, &server)?;
         println!("got proof.");
 
-        Some((proof, server))
+        Some((proof, server.to_string()))
     }
 
     #[apply(shared_tokio_runtime)]
-    async fn test_query_proof() {
-        // Ensure file exists on machine, in case this machine syncs automatically with proof server
+    async fn verify_all_proof_servers_work() {
+        // Ensure file exists on machine, in case this machine syncs
+        // automatically with proof server.
         let program = triton_program!(halt);
         let claim = Claim::about_program(&program);
-        prove_consensus_program(
+        prove_triton_program(
             program,
             claim.clone(),
             NonDeterminism::default(),
@@ -488,12 +504,22 @@ pub mod tests {
 
         // Then verify that the proof server has this file
         let filename = proof_filename(&claim);
-        let (proof, url) =
-            try_fetch_from_server_inner(filename).expect("Expected this proof on the proof server");
-        assert!(
-            triton_vm::verify(Stark::default(), &claim, &proof),
-            "Returned proof from {url} must be valid"
-        );
+        let servers = load_test_proof_servers();
+        let headers = headers_for_proof_server_request();
+        for server in servers {
+            let response = try_fetch_from_server(filename.clone(), server.clone(), headers.clone());
+
+            let proof = match response {
+                Some(data) => decode_proof_from_server(data, &server)
+                    .expect("Returned data must be decodable as proof"),
+                None => panic!("Server: {server} failed to respond with a proof"),
+            };
+
+            assert!(
+                triton_vm::verify(Stark::default(), &claim, &proof),
+                "Returned proof from {server} must be valid"
+            );
+        }
     }
 
     #[test]
@@ -567,7 +593,7 @@ pub mod tests {
             .0
             .iter()
             .copied()
-            .flat_map(|b| b.value().to_be_bytes())
+            .flat_map(|b| b.value().to_be_bytes().to_vec())
             .collect_vec();
         let mut output_file = File::create(path).expect("cannot open file for writing");
         output_file
@@ -575,11 +601,11 @@ pub mod tests {
             .expect("cannot write to file");
     }
 
-    /// Test for regressions in a consensus program.
+    /// Test for regressions in a Triton program.
     ///
-    /// As consensus programs are refactored to improve readability, it is
-    /// important to ensure that the program does not actually change. Any such
-    /// change would constitute a hard fork.
+    /// As Triton programs are refactored to improve readability, it is
+    /// important to ensure that the program does not actually change. If such a
+    /// change affects a *consensus program* then BOOM! hard fork.
     ///
     /// This test checks the program's hash against a hardcoded value. If the
     /// program changes and that hardcoded value is not updated in lockstep, the
@@ -592,7 +618,7 @@ pub mod tests {
     ///
     /// struct MyProgram;
     ///
-    /// impl ConsensusProgram for MyProgram {
+    /// impl TritonProgram for MyProgram {
     ///     fn library_and_code() ->  (Library, Vec<LabelledInstruction>) {
     ///         /// ...
     ///         (Library::new(), vec![])

@@ -1,4 +1,6 @@
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::num::NonZero;
 use std::ops::RangeInclusive;
@@ -11,12 +13,17 @@ use clap::builder::RangedI64ValueParser;
 use clap::builder::TypedValueParser;
 use clap::Parser;
 use itertools::Itertools;
+use libp2p::multiaddr::Protocol;
+use libp2p::Multiaddr;
 use num_traits::Zero;
-use sysinfo::System;
 use tracing::error;
 
 use super::fee_notification_policy::FeeNotificationPolicy;
 use super::network::Network;
+use crate::api::export::ReceivingAddress;
+use crate::application::config::auto_consolidation::AutoConsolidationSettings;
+use crate::application::config::parser::multiaddr::parse_to_multiaddr;
+use crate::application::config::parser::CliArgsParseError;
 use crate::application::config::triton_vm_env_vars::TritonVmEnvVars;
 use crate::application::config::tx_upgrade_filter::TxUpgradeFilter;
 use crate::application::json_rpc::core::api::ops::Namespace;
@@ -80,15 +87,14 @@ pub struct Args {
     /// used here may not contain spaces.
     pub(crate) block_notify: Option<String>,
 
-    /// Ban connections to this node from IP address.
+    /// Ban connections to and from the given IP address.
     ///
-    /// This node can still make outgoing connections to IP address.
+    /// If a libp2p Multiaddr is supplied, the underlying IP address will be
+    /// exctracted.
     ///
-    /// To do this, see `--peer`.
-    ///
-    /// E.g.: --ban 1.2.3.4 --ban 5.6.7.8
-    #[clap(long, value_name = "IP")]
-    pub(crate) ban: Vec<IpAddr>,
+    /// E.g.: --ban 1.2.3.4 --ban /ip4/8.8.4.4/udp/1337/quic-v1
+    #[structopt(long = "ban", value_parser(parse_to_multiaddr))]
+    pub(crate) bans: Vec<Multiaddr>,
 
     /// The threshold at which a peer's standing is considered “bad”. Current
     /// connections to peers in bad standing are terminated. Connection attempts
@@ -159,6 +165,43 @@ pub struct Args {
     #[clap(long, alias = "notx")]
     pub(crate) no_transaction_initiation: bool,
 
+    /// Enable automatic consolidation of UTXOs.
+    ///
+    /// If this flag is set, whenever there are four or more UTXOs managed by
+    /// the wallet, the client will initiate and broadcast a transaction that
+    /// sends UTXOs to either the next unused symmetric key, or else the given
+    /// address.
+    ///
+    /// Examples:
+    ///
+    /// ```text
+    /// --auto-consolidate [nolgam14nguf3jkf.....rfg348f]
+    /// ```
+    // OK to suppress this linter rule because we are parsing and the nested
+    // type tells clap how to parse.
+    #[expect(clippy::option_option)]
+    #[clap(long, default_value = None)]
+    pub(crate) auto_consolidate: Option<Option<String>>,
+
+    /// Whether or not to accept that the consolidation transactions generate
+    /// lustrations, which is the public revelation of the input UTXOs.
+    ///
+    /// The consensus rules may require the inputs to be lustrated, since this
+    /// acts as a transparency gateway ensuring that the historically printed
+    /// amount has not exceeded the intended limit.
+    #[clap(long)]
+    pub(crate) accept_consolidation_lustrations: bool,
+
+    #[clap(skip)]
+    pub(crate) auto_consolidate_cache: OnceLock<AutoConsolidationSettings>,
+
+    /// Upper number of inputs per consolidation transaction.
+    ///
+    /// Sets the number of inputs that each consolidation transaction will
+    /// contain.
+    #[clap(long, default_value = "8", value_name = "NUM_INPUTS")]
+    pub(crate) num_consolidation_inputs: u8,
+
     /// Specify environment variables for Triton VM for a given (log2 of) the
     /// padded height. Can be used to control the environment variables
     /// `TVM_LDE_TRACE` and `RAYON_NUM_THREADS` as a function of the proof's
@@ -225,6 +268,26 @@ pub struct Args {
     /// relayed to peers.
     #[clap(long, default_value = "0.0005", value_parser = NativeCurrencyAmount::coins_from_str)]
     pub(crate) min_relay_pctx_fee_per_input: NativeCurrencyAmount,
+
+    /// If set, all mining rewards will be sent to this address, including fees
+    /// collected for transaction proof upgrading.
+    ///
+    /// Setting this value allows for cold-mining, the process where a machine
+    /// collects various mining rewards without holding the secret key to the
+    /// address where the rewards are sent.
+    ///
+    /// If set, guesser rewards, transaction proof upgrading rewards, and
+    /// composer rewards will be sent to this address. However, a custom
+    /// coinbase distribution takes precendence over this value, in terms of the
+    /// composer rewards.
+    ///
+    /// The method [`Self::mining_address()`] should be preferred when
+    /// reading this value.
+    #[clap(long)]
+    pub mining_address: Option<String>,
+
+    #[clap(skip)]
+    pub(crate) mining_address_cache: OnceLock<Option<ReceivingAddress>>,
 
     /// Whether to produce block proposals, which is the 2nd step of three-step
     /// mining. Note that composing block proposals involves the computationally
@@ -343,7 +406,7 @@ pub struct Args {
     #[clap(long, default_value = "1G", value_name = "SIZE")]
     pub(crate) max_mempool_size: ByteSize,
 
-    /// Port on which to listen for peer connections.
+    /// Port on which to listen for standard (AKA. legacy) TCP peer connections.
     #[clap(long, default_value = "9798", value_name = "PORT")]
     pub peer_port: u16,
 
@@ -351,9 +414,32 @@ pub struct Args {
     #[clap(long, default_value = "9799", value_name = "PORT")]
     pub rpc_port: u16,
 
-    /// IP on which to listen for peer connections. Will default to all network interfaces, IPv4 and IPv6.
+    /// Port on which to listen for libp2p QUIC peer connections.
+    #[clap(long, default_value = "9800", value_name = "PORT")]
+    pub quic_port: u16,
+
+    /// Port on which to listen for libp2p TCP peer connections.
+    #[clap(long, default_value = "9801", value_name = "PORT")]
+    pub tcp_port: u16,
+
+    /// IP on which to listen for peer connections. Will default to all network
+    /// interfaces, IPv4 and IPv6.
     #[clap(short, long, default_value = "::")]
     pub peer_listen_addr: IpAddr,
+
+    /// Public IP where the node is reachable.
+    ///
+    /// Only use for globally accessible IPs. Setting this value overrides
+    /// libp2p AutoNAT behaviour. If no public IPs are set, libp2p's AutoNAT
+    /// protocol will automatically try to guess the NAT status and external
+    /// addresses.
+    ///
+    /// Examples:
+    /// ```text
+    /// --public-ip 93.7.1.1 --public-ip 2001:db8::1428:57ab
+    /// ```
+    #[structopt(long = "public-ip")]
+    pub public_ips: Vec<IpAddr>,
 
     /// Maximum number of blocks that the client can catch up to without going
     /// into sync mode.
@@ -370,16 +456,61 @@ pub struct Args {
     #[clap(long, default_value = "1000", value_parser(RangedI64ValueParser::<usize>::new().range(10..100000)))]
     pub(crate) sync_mode_threshold: usize,
 
-    /// IPs of nodes to connect to, e.g.: --peer 8.8.8.8:9798 --peer 8.8.4.4:1337.
-    #[structopt(long = "peer")]
-    pub peers: Vec<SocketAddr>,
+    /// By default the node will attempt to resume a previously aborted sync
+    /// process, whose blocks are stored in a temporary directory. Set this flag
+    /// to instruct the node ensure it is working in its own temporary directory
+    /// if a sync process is started.
+    #[clap(long)]
+    pub(crate) no_resume_sync: bool,
+
+    /// Override the directory used to store downloaded blocks during sync.
+    ///
+    /// Defaults to a subdirectory under the system temp dir. Setting this is
+    /// handy when the temp partition is too small or you want sync data to
+    /// survive reboots. The directory is created if it doesn't exist.
+    #[clap(long, value_name = "DIR")]
+    pub(crate) sync_dir: Option<PathBuf>,
+
+    /// Multiaddrs (or IPs) of nodes to connect to, e.g.:
+    /// ```text
+    /// --peer /ip4/8.8.8.8 \
+    /// --peer /ip4/8.8.4.4/udp/1337/quic-v1 \
+    /// --peer 139.162.193.206:9798 \
+    /// --peer [2001:bc8:17c0:41e:46a8:42ff:fe22:e8e9]:9798
+    /// ```
+    ///
+    /// It's easier to connect without `/p2p/...` in the end of the address.
+    ///
+    /// The trust assumptions are interpreted in spirit of libp2p Multiaddr.
+    ///
+    /// - without `/p2p/...` it will be adding any peer found on the endpoint;
+    /// - with `/p2p/...` connections to the given endpoint will fail if the
+    ///   `PeerId` there had changed; and it will continue to try to reach this
+    ///   peer indefinitely.
+    #[structopt(long = "peer", value_parser(parse_to_multiaddr))]
+    pub peers: Vec<Multiaddr>,
+
+    /// Generate a fresh identity for this session only.
+    #[clap(long)]
+    pub(crate) incognito: bool,
+
+    /// Generate a new identity to use going forward.
+    ///
+    /// Back up the old identity file.
+    #[clap(long)]
+    pub(crate) new_identity: bool,
+
+    /// Use the identity contained in the given file.
+    #[clap(long)]
+    pub(crate) identity_file: Option<String>,
 
     /// Specify network, `main`, `alpha`, `beta`, `testnet`, or `regtest`
     #[structopt(long, default_value = "main", short)]
     pub network: Network,
 
-    /// Max number of membership proofs stored per owned UTXO
-    #[structopt(long, default_value = "3")]
+    /// Max number of membership proofs stored per owned UTXO. Archival nodes
+    /// do not need to store membership proofs.
+    #[structopt(long, default_value = "0")]
     pub(crate) number_of_mps_per_utxo: usize,
 
     /// Configure how complicated proofs this machine is capable of producing.
@@ -536,6 +667,19 @@ pub struct Args {
     #[clap(long)]
     pub(crate) scan_keys: Option<usize>,
 
+    /// Construct and maintain a UTXO index
+    ///
+    /// If set, all announcements and inputs in all processed blocks will be
+    /// indexed in a database that enables a fast rescan for the discovery of
+    /// all balance-affecting inputs and outputs of blocks.
+    ///
+    /// If blocks have already been processed without this flag active, and the
+    /// flag is later activated, all blocks up to the current tip will be
+    /// indexed, when a new block is set as tip. This process might take some
+    /// time (tens of minutes).
+    #[clap(long)]
+    pub utxo_index: bool,
+
     /// Enable JSON/HTTP RPC.
     /// You can optionally specify an address and port (default: 127.0.0.1:9797).
     /// If not given, RPC is disabled.
@@ -550,6 +694,10 @@ pub struct Args {
     /// RPC modules to enable.
     /// Specifies which sets of RPC methods are exposed (e.g., node or chain).
     /// By default, both "node" and "chain" modules are enabled.
+    ///
+    /// WARNING: Activating some of these endpoints may expose wallet secrets
+    /// through the JSON/HTTP RPC. Make sure you don't activate the wrong ones
+    /// on an unsecured network.
     #[clap(
         long,
         value_parser = clap::value_parser!(Namespace),
@@ -649,6 +797,54 @@ fn parse_range(unparsed_range: &str) -> Result<RangeInclusive<u64>, String> {
 }
 
 impl Args {
+    pub fn default_with_network(network: Network) -> Self {
+        Self {
+            network,
+            ..Default::default()
+        }
+    }
+
+    /// Parse CLI arguments supplementary to CLAP's native parsing.
+    ///
+    /// # Side Effects
+    ///
+    /// Sets cache.
+    ///
+    /// # Panics
+    /// - If this method is ever called more than once on the same object.
+    pub(crate) fn second_parse(&mut self) -> Result<(), CliArgsParseError> {
+        let network = self.network;
+        let auto_consolidate = AutoConsolidationSettings::parse(
+            &self.auto_consolidate,
+            self.num_consolidation_inputs,
+            network,
+            self.accept_consolidation_lustrations,
+        )
+        .map_err(CliArgsParseError::InvalidConsolidationAddress)?;
+        self.auto_consolidate_cache.set(auto_consolidate).unwrap();
+
+        let proving_capability = self.derive_proving_capability()?;
+        self.tx_proving_capability_cache
+            .set(proving_capability)
+            .expect("This function may only be called once.");
+
+        let mining_address = match &self.mining_address {
+            Some(addr) => match ReceivingAddress::from_bech32m(addr, network) {
+                Ok(addr) => Some(addr),
+                Err(_) => {
+                    return Err(CliArgsParseError::InvalidMiningAddress(addr.to_owned()));
+                }
+            },
+            None => None,
+        };
+
+        self.mining_address_cache.set(mining_address).expect(
+            "Cache value may not be set if already set. Is this function being called twice?",
+        );
+
+        Ok(())
+    }
+
     /// Indicates if all incoming peer connections are disallowed.
     pub(crate) fn disallow_all_incoming_peer_connections(&self) -> bool {
         self.max_num_peers.is_zero()
@@ -684,24 +880,31 @@ impl Args {
     /// Cache the result so we don't estimate more than once.
     pub fn proving_capability(&self) -> TxProvingCapability {
         *self.tx_proving_capability_cache.get_or_init(|| {
-            if let Some(proving_capability) = self.tx_proving_capability {
-                proving_capability
-            } else if self.compose {
-                TxProvingCapability::SingleProof
-            } else {
-                Self::estimate_proving_capability()
-            }
+            self.derive_proving_capability()
+                .expect("Must have consistent proving capability")
         })
     }
 
     /// Check if block proposal should be accepted from this IP address.
     pub(crate) fn accept_block_proposal_from(
         &self,
-        ip_address: IpAddr,
+        address: &Multiaddr,
     ) -> Result<(), BlockProposalRejectError> {
         if self.ignore_foreign_compositions {
             return Err(BlockProposalRejectError::IgnoreAllForeign);
         }
+        if self.whitelisted_composers.is_empty() {
+            return Ok(());
+        }
+
+        let ip_address = address
+            .iter()
+            .find_map(|proto| match proto {
+                Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+                Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+                _ => None,
+            })
+            .ok_or(BlockProposalRejectError::NotWhiteListed)?;
 
         let ip_address = match ip_address {
             IpAddr::V4(_) => ip_address,
@@ -710,41 +913,11 @@ impl Args {
                 None => ip_address,
             },
         };
-        if !self.whitelisted_composers.is_empty()
-            && !self.whitelisted_composers.contains(&ip_address)
-        {
+        if !self.whitelisted_composers.contains(&ip_address) {
             return Err(BlockProposalRejectError::NotWhiteListed);
         }
 
         Ok(())
-    }
-
-    fn estimate_proving_capability() -> TxProvingCapability {
-        const SINGLE_PROOF_CORE_REQ: usize = 19;
-        // see https://github.com/Neptune-Crypto/neptune-core/issues/426
-        const SINGLE_PROOF_MEMORY_USAGE: u64 = (1u64 << 30) * 120;
-
-        const PROOF_COLLECTION_CORE_REQ: usize = 2;
-        const PROOF_COLLECTION_MEMORY_USAGE: u64 = (1u64 << 30) * 16;
-
-        let s = System::new_all();
-        let total_memory = s.total_memory();
-        assert!(
-            !total_memory.is_zero(),
-            "Total memory reported illegal value of 0"
-        );
-
-        let physical_core_count = s.physical_core_count().unwrap_or(1);
-
-        if total_memory > SINGLE_PROOF_MEMORY_USAGE && physical_core_count > SINGLE_PROOF_CORE_REQ {
-            TxProvingCapability::SingleProof
-        } else if total_memory > PROOF_COLLECTION_MEMORY_USAGE
-            && physical_core_count > PROOF_COLLECTION_CORE_REQ
-        {
-            TxProvingCapability::ProofCollection
-        } else {
-            TxProvingCapability::PrimitiveWitness
-        }
     }
 
     /// creates a `TritonVmProofJobOptions` from cli args.
@@ -786,6 +959,131 @@ impl Args {
             TransactionProofQuality::SingleProof => true,
         }
     }
+
+    /// Generates the set of local addresses the node should bind to.
+    ///
+    /// This method expands [`Self::peer_listen_addr`] into a list of
+    /// [`Multiaddr`] strings covering both TCP and QUIC transports.
+    ///
+    /// ### Protocol Expansion
+    ///
+    /// - If [`Self::peer_listen_addr`] is set to the unspecified address
+    ///   (`::` or `0.0.0.0`), this returns addresses for **both** IPv4 and IPv6
+    ///   interfaces to ensure maximum reachability.
+    /// - For each IP, it generates a TCP multiaddr on
+    ///   [`libp2p_tcp`](libp2p::tcp) and a QUIC-v1 multiaddr on
+    ///   [`libp2p_quic`](libp2p::quic).
+    ///
+    /// This list specifically excludes [`Self::peer_port`] (Legacy TCP), as
+    /// that port is managed by the legacy networking stack and should not be
+    /// bound by the libp2p [`Swarm`](libp2p::Swarm).
+    ///
+    /// # Return Value
+    ///
+    /// A `Vec<Multiaddr>` in the format:
+    /// - `/ip4/<addr>/tcp/<port>`
+    /// - `/ip4/<addr>/udp/<port>/quic-v1`
+    pub fn own_listen_addresses(&self) -> Vec<Multiaddr> {
+        let mut addrs = Vec::new();
+
+        // Determine if we need to expand "::" into both 0.0.0.0 and ::
+        let ips = if self.peer_listen_addr.is_unspecified() {
+            vec![
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            ]
+        } else {
+            vec![self.peer_listen_addr]
+        };
+
+        for ip in ips {
+            // Add TCP Multiaddr
+            let mut tcp_addr = Multiaddr::from(ip);
+            tcp_addr.push(Protocol::Tcp(self.tcp_port));
+            addrs.push(tcp_addr);
+
+            // Add QUIC Multiaddr (QUIC runs over UDP)
+            let mut quic_addr = Multiaddr::from(ip);
+            quic_addr.push(Protocol::Udp(self.quic_port));
+            quic_addr.push(Protocol::QuicV1);
+            addrs.push(quic_addr);
+        }
+
+        addrs
+    }
+
+    /// List of publicly reachable Multiaddrs with embedded IPv{4,6} defined by
+    /// the user.
+    ///
+    /// If non-empty, this list overrides libp2p's AutoNAT behaviour and informs
+    /// libp2p of the external addresses this node is reachable on.
+    pub(crate) fn own_public_addresses(&self) -> Vec<Multiaddr> {
+        let mut addrs = Vec::new();
+
+        for ip in &self.public_ips {
+            // Add TCP Multiaddr
+            let mut tcp_addr = Multiaddr::from(*ip);
+            tcp_addr.push(Protocol::Tcp(self.tcp_port));
+            addrs.push(tcp_addr);
+
+            // Add QUIC Multiaddr (QUIC runs over UDP)
+            let mut quic_addr = Multiaddr::from(*ip);
+            quic_addr.push(Protocol::Udp(self.quic_port));
+            quic_addr.push(Protocol::QuicV1);
+            addrs.push(quic_addr);
+        }
+
+        addrs
+    }
+
+    /// The list of IPs banned from the CLI.
+    ///
+    /// This convenience function extracts the IPs from the `bans` argument
+    /// which contains `Multiaddr`s, not IPs.
+    pub fn banned_ips(&self) -> Vec<IpAddr> {
+        self.bans
+            .iter()
+            .filter_map(|ma| {
+                ma.iter().find_map(|protocol| match protocol {
+                    Protocol::Ip4(ipv4_addr) => Some(IpAddr::V4(ipv4_addr)),
+                    Protocol::Ip6(ipv6_addr) => Some(IpAddr::V6(ipv6_addr)),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    /// Get the auto-consolidation setting.
+    ///
+    /// Cache should be set by [`Self::second_parse`].
+    ///
+    /// # Panics
+    /// - If cache is not set, and an invalid address is given as consolidation
+    ///   address.
+    pub(crate) fn auto_consolidate(&self) -> AutoConsolidationSettings {
+        self.auto_consolidate_cache
+            .get_or_init(|| {
+                AutoConsolidationSettings::parse(
+                    &self.auto_consolidate,
+                    self.num_consolidation_inputs,
+                    self.network,
+                    self.accept_consolidation_lustrations,
+                )
+                .expect("Must be able to parse auto consolidation setting")
+            })
+            .to_owned()
+    }
+
+    /// The address that all mining rewards should go to.
+    ///
+    /// If None is returned, the wallet must be probed to get an address for
+    /// mining rewards.
+    pub fn mining_address(&self) -> Option<ReceivingAddress> {
+        self.mining_address_cache
+            .get()
+            .expect("Cache must be set before calling this method")
+            .clone()
+    }
 }
 
 impl From<&Args> for ProverJobSettings {
@@ -818,17 +1116,12 @@ mod tests {
     use std::ops::RangeBounds;
 
     use super::*;
+    use crate::api::export::WalletEntropy;
+    use crate::application::config::parser::multiaddr::parse_to_multiaddr;
     use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 
     // extra methods for tests.
     impl Args {
-        pub(crate) fn default_with_network(network: Network) -> Self {
-            Self {
-                network,
-                ..Default::default()
-            }
-        }
-
         pub(crate) fn proof_job_options_prooftype(
             &self,
             proof_type: TransactionProofType,
@@ -866,12 +1159,6 @@ mod tests {
             ..Default::default()
         };
         assert!(args.disallow_all_incoming_peer_connections());
-    }
-
-    #[test]
-    fn estimate_own_proving_capability() {
-        // doubles as a no-crash test
-        println!("{}", Args::estimate_proving_capability());
     }
 
     #[test]
@@ -972,5 +1259,43 @@ mod tests {
         assert_range_eq!(5u64..=u64::MAX, parse_range("5:").unwrap());
         assert_range_eq!(0u64..10, parse_range(":10").unwrap());
         assert_range_eq!(0u64..=u64::MAX, parse_range(":").unwrap());
+    }
+
+    #[test]
+    fn can_specify_ips_as_peers() {
+        let mut cli = Args::default();
+
+        let ipv4 = "139.162.193.206:9798".to_string();
+        let ipv6 = "[2001:bc8:17c0:41e:46a8:42ff:fe22:e8e9]:9798".to_string();
+
+        cli.peers.push(parse_to_multiaddr(&ipv4).unwrap());
+        cli.peers.push(parse_to_multiaddr(&ipv6).unwrap());
+    }
+
+    #[test]
+    fn can_specify_multiaddrs_as_peers() {
+        let mut cli = Args::default();
+
+        let ipv4 = "/ip4/8.8.8.8".to_string();
+        let ipv4_udp_quic = "/ip4/8.8.4.4/udp/1337/quic-v1".to_string();
+
+        cli.peers.push(parse_to_multiaddr(&ipv4).unwrap());
+        cli.peers.push(parse_to_multiaddr(&ipv4_udp_quic).unwrap());
+    }
+
+    #[test]
+    fn uses_mining_address_value() {
+        let network = Network::Main;
+        let devnet_address = WalletEntropy::devnet_wallet()
+            .nth_generation_spending_key(0)
+            .to_address();
+        let devnet_address: ReceivingAddress = devnet_address.into();
+        let devnet_address_str = devnet_address.to_display_bech32m(network).unwrap();
+
+        let mut cli = Args::default_with_network(network);
+        cli.mining_address = Some(devnet_address_str);
+        cli.second_parse().unwrap();
+
+        assert_eq!(devnet_address, cli.mining_address().unwrap());
     }
 }

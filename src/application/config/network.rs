@@ -125,22 +125,6 @@ impl Network {
             Self::Main | Self::Testnet(_) | Self::TestnetMock => Timestamp::millis(588000),
         }
     }
-
-    /// indicates if automated mining should be performed by this network
-    ///
-    /// note: we disable auto-mining in regtest mode because it generates blocks
-    /// very quickly and that is not a good fit when mining is enabled for
-    /// duration of the neptune-core process as blockchain grows very quickly.
-    ///
-    /// instead developers are encouraged to use [crate::api::regtest] module to
-    /// generate any number of blocks in a controlled, deterministic fashion.
-    //
-    // bitcoin-core does not use cli flags, but rather RPC commands to
-    // enable/disable mining in controlled fashion. We might consider moving to
-    // that model before enabling automated mining for RegTest.
-    pub fn performs_automated_mining(&self) -> bool {
-        !self.is_reg_test()
-    }
 }
 
 impl fmt::Display for Network {
@@ -173,6 +157,33 @@ impl FromStr for Network {
                     Err(format!("Failed to parse '{}' as network", input))
                 }
             }
+        }
+    }
+}
+
+// #[cfg(any(test, feature = "arbitrary-impls"))]
+#[cfg(test)] // otherwise "unused" warnings
+pub(crate) mod arbitrary {
+    use proptest::prelude::BoxedStrategy;
+    use proptest::prelude::Strategy;
+    use proptest_arbitrary_interop::arb;
+
+    use super::*;
+
+    impl Network {
+        pub(crate) fn arbitrary() -> BoxedStrategy<Self> {
+            let determinant_strategy = 0..4;
+            let distinguisher_strategy = arb::<u8>();
+
+            (determinant_strategy, distinguisher_strategy)
+                .prop_map(|(determinant, distinguisher)| match determinant {
+                    0 => Network::TestnetMock,
+                    1 => Network::Testnet(distinguisher),
+                    2 => Network::RegTest,
+                    3 => Network::Main,
+                    _ => unreachable!("all networks accounted for"),
+                })
+                .boxed()
         }
     }
 }

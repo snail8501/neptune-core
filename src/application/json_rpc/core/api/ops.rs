@@ -2,7 +2,6 @@ use neptune_rpc_macros::Router;
 use neptune_rpc_macros::Routes;
 use serde::Deserialize;
 use serde::Serialize;
-use strum::EnumString;
 
 use crate::application::json_rpc::core::api::client::transport::Transport;
 use crate::application::json_rpc::core::api::rpc::RpcApi;
@@ -12,23 +11,51 @@ use crate::application::json_rpc::core::model::json::JsonError;
 use crate::application::json_rpc::core::model::message::*;
 
 /// API version.
-pub const RPC_API_VERSION: u16 = 1;
+///
+/// Must be bumped every time a breaking change to the RPC API is made. Adding
+/// a new endpoint is not a breaking change. Neither is adding a new field to
+/// a type that is returned by this API.
+pub const RPC_API_VERSION: u16 = 2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, EnumString)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::Display,
+)]
 #[serde(rename_all = "camelCase")]
-#[strum(ascii_case_insensitive)]
+#[strum(ascii_case_insensitive, serialize_all = "camelCase")]
 pub enum Namespace {
     Node,
-    Networking,
+    Network,
     Chain,
     Mining,
     Archival,
+
+    /// Endpoints for inspecting the mempool status
     Mempool,
+
+    /// Endpoints for serving external wallets
     Wallet,
+
+    /// Endpoints for managing personal wallet
+    Personal,
+
+    /// Endpoints relating to and requiring a UTXO index
+    Utxoindex,
 }
 
-#[derive(Router, Routes, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Router, Routes, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::Display,
+)]
 #[serde(rename_all = "camelCase")]
+#[strum(serialize_all = "camelCase")]
 pub enum RpcMethods {
     #[namespace(Namespace::Node)]
     Network,
@@ -95,12 +122,135 @@ pub enum RpcMethods {
 
     #[namespace(Namespace::Archival)]
     FindUtxoOrigin,
+
+    #[namespace(Namespace::Archival)]
+    AreBloomIndicesSet,
+
+    #[namespace(Namespace::Archival)]
+    CirculatingSupply,
+
+    #[namespace(Namespace::Archival)]
+    MaxSupply,
+
+    #[namespace(Namespace::Archival)]
+    BurnedSupply,
+
+    #[namespace(Namespace::Wallet)]
+    ValidateAddress,
+
+    #[namespace(Namespace::Wallet)]
+    ValidateCoinsAmount,
+
+    #[namespace(Namespace::Wallet)]
+    ValidateNauAmount,
+
+    #[namespace(Namespace::Wallet)]
+    GetBlocks,
+
+    #[namespace(Namespace::Wallet)]
+    RestoreMembershipProof,
+
+    #[namespace(Namespace::Wallet)]
+    SubmitTransaction,
+
+    #[namespace(Namespace::Personal)]
+    RescanAnnounced,
+
+    #[namespace(Namespace::Personal)]
+    RescanExpected,
+
+    #[namespace(Namespace::Personal)]
+    RescanOutgoing,
+
+    #[namespace(Namespace::Personal)]
+    RescanGuesserRewards,
+
+    #[namespace(Namespace::Personal)]
+    DerivationIndex,
+
+    #[namespace(Namespace::Personal)]
+    SetDerivationIndex,
+
+    #[namespace(Namespace::Personal)]
+    GenerateAddress,
+
+    #[namespace(Namespace::Personal)]
+    IncomingHistory,
+
+    #[namespace(Namespace::Personal)]
+    OutgoingHistory,
+
+    #[namespace(Namespace::Personal)]
+    UnspentUtxos,
+
+    #[namespace(Namespace::Personal)]
+    GetBalance,
+
+    #[namespace(Namespace::Personal)]
+    CountSentTransactionsAtBlock,
+
+    #[namespace(Namespace::Personal)]
+    Send,
+
+    #[namespace(Namespace::Personal)]
+    ClaimUtxo,
+
+    #[namespace(Namespace::Mining)]
+    GetBlockTemplate,
+
+    #[namespace(Namespace::Mining)]
+    SubmitBlock,
+
+    #[namespace(Namespace::Utxoindex)]
+    BlockHeightsByFlags,
+
+    #[namespace(Namespace::Utxoindex)]
+    BlockHeightsByAdditionRecords,
+
+    #[namespace(Namespace::Utxoindex)]
+    BlockHeightsByAbsoluteIndexSets,
+
+    #[namespace(Namespace::Utxoindex)]
+    WasMined,
+
+    #[namespace(Namespace::Mempool)]
+    Transactions,
+
+    #[namespace(Namespace::Mempool)]
+    GetTransactionKernel,
+
+    #[namespace(Namespace::Mempool)]
+    GetTransactionProof,
+
+    #[namespace(Namespace::Mempool)]
+    GetTransactionsByAdditionRecords,
+
+    #[namespace(Namespace::Mempool)]
+    GetTransactionsByAbsoluteIndexSets,
+
+    #[namespace(Namespace::Mempool)]
+    BestTransactionForNextBlock,
+
+    #[namespace(Namespace::Network)]
+    Ban,
+    #[namespace(Namespace::Network)]
+    Unban,
+    #[namespace(Namespace::Network)]
+    UnbanAll,
+    #[namespace(Namespace::Network)]
+    Dial,
+    #[namespace(Namespace::Network)]
+    ProbeNat,
+    #[namespace(Namespace::Network)]
+    ResetRelayReservations,
+    #[namespace(Namespace::Network)]
+    NetworkOverview,
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use crate::application::json_rpc::core::api::ops::Namespace;
+    use super::*;
 
     #[test]
     fn namespace_parses_case_insensitively() {
@@ -114,6 +264,15 @@ mod tests {
         assert!(
             Namespace::from_str("nodewallet").is_err(),
             "Expected parse error for invalid namespace"
+        );
+    }
+
+    #[test]
+    fn display_names_use_camelcase() {
+        assert_eq!("wallet".to_owned(), Namespace::Wallet.to_string());
+        assert_eq!(
+            "submitTransaction".to_owned(),
+            RpcMethods::SubmitTransaction.to_string()
         );
     }
 }
