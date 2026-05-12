@@ -621,7 +621,7 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
         }
     }
 
-    pub(super) fn validate(
+    pub fn validate(
         self,
         auth_paths: PowMastPaths,
         target: Digest,
