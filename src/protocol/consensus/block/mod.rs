@@ -1210,6 +1210,12 @@ impl Block {
         self.unset_digest();
     }
 
+    // TODO set_header_timestamp
+    pub fn set_header_timestamp(&mut self, timestamp: Timestamp) {
+        self.kernel.header.timestamp = timestamp;
+        self.unset_digest();
+    }
+
     /// Evaluate the fork choice rule.
     ///
     /// Given two blocks, determine which one is more canonical. This function
